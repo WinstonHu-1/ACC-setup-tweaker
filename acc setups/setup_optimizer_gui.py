@@ -20,6 +20,10 @@ from setup_optimizer import (
     TelemetryAnalyzer,
     TRACK_MAP,
     RECOMMENDATIONS,
+    TRACK_TUNING_PROFILES,
+    list_base_setups,
+    add_base_setup,
+    car_display_name,
 )
 
 
@@ -798,7 +802,8 @@ class SetupOptimizerApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         root.title("ACC Setup Optimizer — Driver61 + MoTeC")
-        root.geometry("1500x780")
+        root.geometry("1620x920")
+        root.minsize(1280, 760)
         root.configure(bg="#1c1f24")
 
         self.mgr: SetupManager | None = None
@@ -829,24 +834,68 @@ class SetupOptimizerApp:
         style.configure("TRadiobutton", background="#1c1f24", foreground="#dcdcdc")
 
     # ---- layout ----
+    @staticmethod
+    def _make_scrollable(parent) -> ttk.Frame:
+        """Wrap `parent` with a Canvas + vertical Scrollbar and return an
+        inner ttk.Frame that scrolls. Needed because the left and right
+        columns now have more controls than fit in 720px on small monitors.
+        """
+        outer = ttk.Frame(parent)
+        outer.pack(fill="both", expand=True)
+        canvas = tk.Canvas(outer, bg="#1c1f24", highlightthickness=0,
+                           borderwidth=0)
+        vscroll = ttk.Scrollbar(outer, orient="vertical",
+                                command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vscroll.pack(side="right", fill="y")
+
+        inner = ttk.Frame(canvas, padding=(0, 0, 8, 0))
+        inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_inner_configure(_e):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        inner.bind("<Configure>", _on_inner_configure)
+
+        def _on_canvas_configure(e):
+            # Match inner frame width to the canvas so children pack-fill
+            # correctly horizontally.
+            canvas.itemconfigure(inner_id, width=e.width)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        # Mouse-wheel scrolling (macOS gives small floats; Windows gives
+        # multiples of 120; Linux uses Button-4 / Button-5).
+        def _on_mousewheel(e):
+            delta = -1 if (getattr(e, "delta", 0) > 0
+                           or getattr(e, "num", 0) == 4) else 1
+            canvas.yview_scroll(delta, "units")
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            canvas.bind_all(seq, _on_mousewheel, add="+")
+
+        return inner
+
     def _build_layout(self) -> None:
         root = self.root
-        root.columnconfigure(0, weight=0, minsize=290)
+        root.columnconfigure(0, weight=0, minsize=300)
         root.columnconfigure(1, weight=1)
-        root.columnconfigure(2, weight=0, minsize=320)
+        root.columnconfigure(2, weight=0, minsize=380)
         root.rowconfigure(0, weight=1)
         root.rowconfigure(1, weight=0)
 
-        self.left = ttk.Frame(root, padding=12)
-        self.left.grid(row=0, column=0, sticky="nsew")
+        # Left and right columns get a Canvas-based vertical scroller so
+        # nothing falls off the bottom on smaller windows.
+        left_outer = ttk.Frame(root, padding=(12, 12, 0, 12))
+        left_outer.grid(row=0, column=0, sticky="nsew")
+        self.left = self._make_scrollable(left_outer)
         self._build_left(self.left)
 
         self.center = ttk.Frame(root, padding=12)
         self.center.grid(row=0, column=1, sticky="nsew")
         self._build_center(self.center)
 
-        self.right = ttk.Frame(root, padding=12)
-        self.right.grid(row=0, column=2, sticky="nsew")
+        right_outer = ttk.Frame(root, padding=(0, 12, 12, 12))
+        right_outer.grid(row=0, column=2, sticky="nsew")
+        self.right = self._make_scrollable(right_outer)
         self._build_right(self.right)
 
         self.status_var = tk.StringVar(value="")
@@ -855,54 +904,81 @@ class SetupOptimizerApp:
         status.grid(row=1, column=0, columnspan=3, sticky="ew")
 
     def _build_left(self, parent: ttk.Frame) -> None:
-        ttk.Label(parent, text="Files", style="Header.TLabel").pack(anchor="w")
+        ttk.Label(parent, text="Car & setup",
+                  style="Header.TLabel").pack(anchor="w")
 
-        # setup JSON
-        ttk.Label(parent, text="ACC setup JSON:").pack(anchor="w", pady=(8, 2))
+        # ---- Car selector ----
+        ttk.Label(parent, text="Car:").pack(anchor="w", pady=(8, 2))
+        car_row = ttk.Frame(parent); car_row.pack(fill="x")
+        self.car_var = tk.StringVar()
+        self.car_combo = ttk.Combobox(car_row, textvariable=self.car_var,
+                                      state="readonly", width=24)
+        self.car_combo.pack(side="left", fill="x", expand=True)
+        self.car_combo.bind("<<ComboboxSelected>>", self._on_car_change)
+        ttk.Button(car_row, text="Add new car…",
+                   command=self._add_new_car).pack(side="left", padx=4)
+        self._refresh_car_list()
+
+        # ---- Setup picker (optional override) ----
+        ttk.Label(parent,
+                  text="Setup (optional — leave empty to use the car's base):"
+                  ).pack(anchor="w", pady=(8, 2))
         self.setup_path_var = tk.StringVar()
         row = ttk.Frame(parent); row.pack(fill="x")
         ttk.Entry(row, textvariable=self.setup_path_var, width=24).pack(
             side="left", fill="x", expand=True)
-        ttk.Button(row, text="Browse…", command=self._pick_setup).pack(side="left", padx=4)
+        ttk.Button(row, text="Browse…", command=self._pick_setup).pack(
+            side="left", padx=4)
         ttk.Button(parent, text="Load setup", command=self._load_setup,
                    style="Accent.TButton").pack(fill="x", pady=(6, 4))
 
-        # MoTeC telemetry (optional)
-        ttk.Label(parent, text="MoTeC telemetry (.ld, .ldx, or .csv):"
-                  ).pack(anchor="w", pady=(12, 2))
+        # ---- MoTeC telemetry ----
+        ttk.Separator(parent).pack(fill="x", pady=10)
+        ttk.Label(parent, text="MoTeC telemetry",
+                  style="Header.TLabel").pack(anchor="w")
+        ttk.Label(parent,
+                  text=".ld / .ldx (raw ACC log) or .csv export from i2 Pro:"
+                  ).pack(anchor="w", pady=(4, 2))
         self.csv_path_var = tk.StringVar()
         row = ttk.Frame(parent); row.pack(fill="x")
         ttk.Entry(row, textvariable=self.csv_path_var, width=24).pack(
             side="left", fill="x", expand=True)
-        ttk.Button(row, text="Browse…", command=self._pick_csv).pack(side="left", padx=4)
-        ttk.Button(parent, text="Load telemetry", command=self._load_csv).pack(
-            fill="x", pady=(6, 4))
-        ttk.Button(parent, text="Clear telemetry", command=self._clear_csv).pack(
-            fill="x")
+        ttk.Button(row, text="Browse…", command=self._pick_csv).pack(
+            side="left", padx=4)
+        ttk.Button(parent, text="Open ACC MoTeC folder",
+                   command=self._open_motec_folder).pack(fill="x", pady=(4, 0))
+        ttk.Button(parent, text="Load telemetry",
+                   command=self._load_csv,
+                   style="Accent.TButton").pack(fill="x", pady=(6, 4))
+        ttk.Button(parent, text="Clear telemetry",
+                   command=self._clear_csv).pack(fill="x")
 
-        ttk.Separator(parent).pack(fill="x", pady=12)
-
-        # temperature
+        # ---- Temperature compensation ----
+        ttk.Separator(parent).pack(fill="x", pady=10)
         ttk.Label(parent, text="Temperature compensation",
                   style="Header.TLabel").pack(anchor="w")
-        ttk.Label(parent, text="Base setup is calibrated for 20°C ambient.").pack(
-            anchor="w", pady=(4, 0))
+        ttk.Label(parent,
+                  text="Base setups are calibrated for 20°C ambient."
+                  ).pack(anchor="w", pady=(4, 0))
         row = ttk.Frame(parent); row.pack(fill="x", pady=(6, 0))
         ttk.Label(row, text="Target ambient (°C):").pack(side="left")
         self.temp_var = tk.StringVar(value=self.DEFAULT_TEMP)
-        ttk.Entry(row, textvariable=self.temp_var, width=6).pack(side="left", padx=6)
+        ttk.Entry(row, textvariable=self.temp_var, width=6).pack(
+            side="left", padx=6)
         ttk.Button(parent, text="Apply temperature comp",
                    command=self._apply_temperature).pack(fill="x", pady=(6, 0))
 
-        ttk.Separator(parent).pack(fill="x", pady=12)
-
-        # car / state info
-        ttk.Label(parent, text="Loaded", style="Header.TLabel").pack(anchor="w")
-        self.car_var = tk.StringVar(value="(no setup loaded)")
-        ttk.Label(parent, textvariable=self.car_var,
-                  font=("Helvetica", 11, "bold")).pack(anchor="w", pady=(4, 0))
+        # ---- Loaded state ----
+        ttk.Separator(parent).pack(fill="x", pady=10)
+        ttk.Label(parent, text="Loaded",
+                  style="Header.TLabel").pack(anchor="w")
+        self.loaded_setup_var = tk.StringVar(value="(no setup loaded)")
+        ttk.Label(parent, textvariable=self.loaded_setup_var,
+                  font=("Helvetica", 11, "bold"),
+                  wraplength=270).pack(anchor="w", pady=(4, 0))
         self.tel_var = tk.StringVar(value="Telemetry: not loaded")
-        ttk.Label(parent, textvariable=self.tel_var).pack(anchor="w")
+        ttk.Label(parent, textvariable=self.tel_var,
+                  wraplength=270).pack(anchor="w")
 
     def _build_center(self, parent: ttk.Frame) -> None:
         ttk.Label(parent, text="Track (decorative)",
@@ -917,6 +993,12 @@ class SetupOptimizerApp:
         cb.bind("<<ComboboxSelected>>", self._on_track_change)
 
         self.selected_corner_var = tk.StringVar(value="")
+
+        # Right-aligned: nudge the setup toward the selected track's
+        # engineering baseline (downforce, ride height, ARB, diff preload,
+        # bump-stop window, brake bias).
+        ttk.Button(row, text="Tune toward track-optimal",
+                   command=self._tune_for_track).pack(side="right")
 
         # Decorative track map — shrunk so the telemetry chart gets room.
         self.map = TrackMapCanvas(parent, height=300)
@@ -958,78 +1040,131 @@ class SetupOptimizerApp:
         ttk.Button(range_row, text="Auto-classify this range",
                    command=self._analyze_custom_range).pack(side="right")
 
-        # ---- Driver-input row: Issue + Phase + "Diagnose with my input" --
+        # ---- Driver complaints with per-complaint severity sliders ------
+        # Each row = one (issue, phase) combination. Tick the box, set the
+        # severity 1-5, and the diagnose() pipeline will scale every
+        # adjustment by the slider's value via SetupManager's
+        # SEVERITY_TO_CLICKS mapping (1-2 → 1 click, 3 → 2, 4 → 3, 5 → 4).
         ttk.Separator(parent).pack(fill="x", pady=(8, 6))
-        driver_lbl = ttk.Label(
-            parent,
-            text="Driver complaint — combine your call with the telemetry:",
-            foreground="#cdb060",
-        )
-        driver_lbl.pack(anchor="w")
+        ttk.Label(parent,
+                  text="Driver complaints — tick the issues you felt on "
+                       "this range and rate the severity (1=mild, 5=severe). "
+                       "Each ticked complaint becomes a separate row with "
+                       "its own telemetry-ranked fix list.",
+                  foreground="#cdb060", wraplength=600).pack(anchor="w")
 
-        di_row = ttk.Frame(parent); di_row.pack(fill="x", pady=(4, 2))
-        ttk.Label(di_row, text="Issue:").pack(side="left")
-        self.driver_issue_var = tk.StringVar(value="Understeer")
-        for issue in ("Understeer", "Oversteer", "Unstable", "Bottoming"):
-            ttk.Radiobutton(di_row, text=issue,
-                            variable=self.driver_issue_var,
-                            value=issue,
-                            command=self._on_driver_issue_change).pack(
-                side="left", padx=4)
+        # Internal state: (issue, phase) → {"checked": BooleanVar, "severity": IntVar}.
+        self._complaints: dict[tuple[str, str], dict[str, tk.Variable]] = {}
 
-        dp_row = ttk.Frame(parent); dp_row.pack(fill="x", pady=(0, 2))
-        ttk.Label(dp_row, text="Phase:").pack(side="left")
-        self.driver_phase_var = tk.StringVar(value="Mid")
-        self._driver_phase_buttons = []
-        for ph in ("Entry", "Mid", "Exit"):
-            rb = ttk.Radiobutton(dp_row, text=ph,
-                                 variable=self.driver_phase_var, value=ph)
-            rb.pack(side="left", padx=4)
-            self._driver_phase_buttons.append(rb)
-        ttk.Button(dp_row, text="Diagnose with my input",
+        complaint_rows = [
+            ("Understeer", "Entry",  "Understeer  on Entry"),
+            ("Understeer", "Mid",    "Understeer  mid corner"),
+            ("Understeer", "Exit",   "Understeer  on Exit"),
+            ("Oversteer",  "Entry",  "Oversteer   on Entry"),
+            ("Oversteer",  "Mid",    "Oversteer   mid corner"),
+            ("Oversteer",  "Exit",   "Oversteer   on Exit"),
+            ("Unstable",   "Corner", "Unstable    (whole corner)"),
+            ("Bottoming",  "Corner", "Bottoming   (whole corner)"),
+        ]
+
+        rows_frame = ttk.Frame(parent); rows_frame.pack(fill="x", pady=(4, 0))
+        for issue, phase, label_text in complaint_rows:
+            row = ttk.Frame(rows_frame)
+            row.pack(fill="x", pady=1)
+
+            chk_var = tk.BooleanVar(value=False)
+            sev_var = tk.IntVar(value=3)
+            self._complaints[(issue, phase)] = {
+                "checked":  chk_var,
+                "severity": sev_var,
+            }
+
+            ttk.Checkbutton(row, text=label_text, variable=chk_var,
+                            width=28).pack(side="left")
+
+            # Severity slider — tk.Scale (not ttk) because ttk.Scale won't
+            # show its current value on the slider itself.
+            sev_label_var = tk.StringVar(value="3")
+            sev_label = ttk.Label(row, textvariable=sev_label_var,
+                                  width=2,
+                                  foreground="#cdb060",
+                                  font=("Helvetica", 10, "bold"))
+            sev_label.pack(side="right", padx=(4, 0))
+
+            def _on_change(value, lv=sev_label_var):
+                lv.set(str(int(float(value))))
+
+            scale = tk.Scale(
+                row, from_=1, to=5, orient="horizontal",
+                variable=sev_var, showvalue=False, resolution=1,
+                length=120, sliderlength=18,
+                bg="#1c1f24", fg="#cdb060",
+                troughcolor="#2c3138", highlightthickness=0,
+                activebackground="#5cd0ff", borderwidth=0,
+                command=_on_change,
+            )
+            scale.pack(side="right", padx=(8, 0))
+            ttk.Label(row, text="severity:",
+                      foreground="#888").pack(side="right", padx=(8, 4))
+
+        btn_row = ttk.Frame(parent); btn_row.pack(fill="x", pady=(8, 0))
+        ttk.Button(btn_row, text="Clear complaints",
+                   command=self._clear_complaints).pack(side="left")
+        ttk.Button(btn_row, text="Diagnose with my input",
                    command=self._diagnose_driver_input,
                    style="Accent.TButton").pack(side="right")
 
         ttk.Label(parent,
-                  text="Drag a region on the trace, pick the issue + phase "
-                       "you felt, then click 'Diagnose with my input'. "
-                       "The fix list on the right is re-ranked using the "
-                       "telemetry for that exact range.",
-                  foreground="#888", wraplength=600).pack(anchor="w",
-                                                          pady=(4, 0))
+                  text="A 5/5 severity multiplies every fix by 4 clicks; "
+                       "1/5 keeps it at the conservative 1-click step.",
+                  foreground="#888", wraplength=600,
+                  font=("Helvetica", 9, "italic")).pack(anchor="w",
+                                                        pady=(4, 0))
 
     def _build_right(self, parent: ttk.Frame) -> None:
         ttk.Label(parent, text="Telemetry Analysis (MoTeC i2 Pro)",
                   style="Header.TLabel").pack(anchor="w")
 
-        ttk.Button(parent, text="Run analysis on loaded telemetry",
+        ttk.Button(parent, text="Auto-diagnose telemetry",
                    command=self._run_analysis,
                    style="Accent.TButton").pack(fill="x", pady=(6, 4))
 
-        lap_row = ttk.Frame(parent); lap_row.pack(fill="x", pady=(2, 4))
-        ttk.Label(lap_row, text="Lap:").pack(side="left")
-        self.lap_var = tk.StringVar(value="(no laps yet)")
-        self.lap_combo = ttk.Combobox(lap_row, textvariable=self.lap_var,
-                                      values=[], state="readonly", width=24)
-        self.lap_combo.pack(side="left", padx=6)
-        self.lap_combo.bind("<<ComboboxSelected>>",
-                            lambda _e: self._run_analysis())
+        # Multi-lap selection. Listbox with extended select mode lets the
+        # driver tick several laps and analyse them as a unit. Cmd/Ctrl-click
+        # toggles, Shift-click extends.
+        ttk.Label(parent, text="Laps (Cmd/Ctrl-click to multi-select):"
+                  ).pack(anchor="w", pady=(2, 2))
+        lap_row = ttk.Frame(parent); lap_row.pack(fill="x", pady=(0, 4))
+        self.lap_listbox = tk.Listbox(
+            lap_row, selectmode="extended", height=4, exportselection=False,
+            bg="#262a30", fg="#dcdcdc", selectbackground="#5cd0ff",
+            selectforeground="#000", highlightthickness=0, borderwidth=0,
+        )
+        self.lap_listbox.pack(side="left", fill="x", expand=True)
+        lap_btns = ttk.Frame(lap_row); lap_btns.pack(side="left", padx=(6, 0))
+        ttk.Button(lap_btns, text="All laps",
+                   command=self._select_all_laps).pack(fill="x")
+        ttk.Button(lap_btns, text="Re-analyse",
+                   command=self._run_analysis).pack(fill="x", pady=(2, 0))
 
-        # Detected-issues table
+        # Detected-issues table — auto-populated by Auto-diagnose. The Top
+        # Fix column shows the highest-confidence Driver61 fix from the
+        # telemetry-driven diagnose() pipeline so the user can see the
+        # recommended action without opening every row.
         ttk.Label(parent, text="Detected issues",
                   style="Header.TLabel").pack(anchor="w", pady=(8, 2))
-        cols = ("corner", "phase", "issue", "min_sp", "g_lat", "brake")
+        cols = ("lap", "corner", "phase", "issue", "conf", "top_fix")
         self.issues_tree = ttk.Treeview(parent, columns=cols,
-                                        show="headings", height=8)
-        widths = {"corner": 90, "phase": 55, "issue": 90,
-                  "min_sp": 60, "g_lat": 55, "brake": 55}
-        labels = {"corner": "Corner", "phase": "Phase", "issue": "Issue",
-                  "min_sp": "Min Sp", "g_lat": "Pk G",  "brake": "Brk%"}
+                                        show="headings", height=10)
+        widths = {"lap": 38, "corner": 110, "phase": 55, "issue": 80,
+                  "conf": 50, "top_fix": 200}
+        labels = {"lap": "Lap", "corner": "Corner", "phase": "Phase",
+                  "issue": "Issue", "conf": "Conf", "top_fix": "Top fix"}
         for c in cols:
             self.issues_tree.heading(c, text=labels[c])
-            anchor = "w" if c in ("corner", "phase", "issue") else "e"
+            anchor = "w" if c in ("corner", "phase", "issue", "top_fix") else "e"
             self.issues_tree.column(c, width=widths[c], anchor=anchor,
-                                    stretch=(c == "corner"))
+                                    stretch=(c == "top_fix"))
         self.issues_tree.pack(fill="x")
         self.issues_tree.bind("<<TreeviewSelect>>", self._on_issue_select)
 
@@ -1061,8 +1196,9 @@ class SetupOptimizerApp:
         ttk.Button(row, text="Apply selected fix",
                    command=self._apply_selected_telem
                    ).pack(side="left", expand=True, fill="x", padx=2)
-        ttk.Button(row, text="Apply 1st fix to ALL issues",
-                   command=self._apply_all_detected
+        ttk.Button(row, text="Apply ALL top fixes",
+                   command=self._apply_all_detected,
+                   style="Accent.TButton",
                    ).pack(side="left", expand=True, fill="x", padx=2)
 
         # queue + save/reset (unchanged)
@@ -1144,26 +1280,125 @@ class SetupOptimizerApp:
         if p:
             self.csv_path_var.set(p)
 
-    def _load_setup(self) -> None:
-        path = self.setup_path_var.get().strip()
-        if not path or not os.path.isfile(path):
-            messagebox.showerror("Setup", "Pick a valid setup JSON first.")
+    # ---- Car management ----
+    def _refresh_car_list(self) -> None:
+        """Reload the dropdown values from base_setups/, preserving the
+        current selection if possible."""
+        registry = list_base_setups()
+        labels = [f"{car_display_name(cid)}  ({cid})" for cid in sorted(registry)]
+        self._car_id_by_label = {
+            f"{car_display_name(cid)}  ({cid})": cid for cid in sorted(registry)
+        }
+        self._base_setup_for_car = registry
+        self.car_combo.configure(values=labels)
+        if labels and self.car_var.get() not in labels:
+            self.car_var.set(labels[0])
+
+    def _selected_car_id(self) -> str | None:
+        return self._car_id_by_label.get(self.car_var.get())
+
+    def _on_car_change(self, _ev=None) -> None:
+        """When the user picks a car, hint that loading will use the base
+        setup unless an explicit setup has been chosen."""
+        cid = self._selected_car_id()
+        if not cid:
             return
+        self._set_status(
+            f"Active car: {car_display_name(cid)}. "
+            f"'Load setup' will use the base setup unless a file is picked."
+        )
+
+    def _add_new_car(self) -> None:
+        """Pick a setup file and register it as the base for its car."""
+        p = filedialog.askopenfilename(
+            title="Pick a setup file to register as a new car's base",
+            initialdir=os.path.dirname(os.path.abspath(__file__)),
+            filetypes=[("ACC setup", "*.json"), ("All files", "*.*")],
+        )
+        if not p:
+            return
+        try:
+            car_id = add_base_setup(p)
+        except (ValueError, OSError) as e:
+            messagebox.showerror("Add car", f"Couldn't register setup: {e}")
+            return
+        self._refresh_car_list()
+        # Preselect the newly added car.
+        for label, cid in self._car_id_by_label.items():
+            if cid == car_id:
+                self.car_var.set(label)
+                break
+        self._set_status(f"Added base setup for {car_display_name(car_id)}.")
+
+    def _open_motec_folder(self) -> None:
+        """Open the ACC MoTeC folder in the system file browser, then leave
+        the file picker on for the user to pick a session."""
+        acc_dir = self._default_motec_dir()
+        if not acc_dir:
+            messagebox.showinfo(
+                "Open ACC MoTeC folder",
+                "Couldn't find the ACC MoTeC folder. It's normally at\n"
+                "  ~/Documents/Assetto Corsa Competizione/MoTeC/\n"
+                "(or under OneDrive\\Documents on Windows).",
+            )
+            return
+        try:
+            if sys.platform == "darwin":
+                subprocess.run(["open", acc_dir], check=False)
+            elif os.name == "nt":
+                os.startfile(acc_dir)    # type: ignore[attr-defined]
+            else:
+                subprocess.run(["xdg-open", acc_dir], check=False)
+        except Exception:
+            pass
+        # Now also pop the file picker so the user can pick a .ld/.ldx.
+        self._pick_csv()
+
+    # ---- Setup loading ----
+    def _load_setup(self) -> None:
+        """Load a setup JSON. If no explicit setup path is given, fall back
+        to the active car's base setup. If both are present, the explicit
+        setup wins."""
+        path = self.setup_path_var.get().strip()
+        if not path:
+            # Fall back to the selected car's base setup.
+            cid = self._selected_car_id()
+            if not cid or cid not in self._base_setup_for_car:
+                messagebox.showinfo(
+                    "Load setup",
+                    "Pick a car (or a setup JSON) first.",
+                )
+                return
+            path = self._base_setup_for_car[cid]
+            using_base = True
+        else:
+            using_base = False
+            if not os.path.isfile(path):
+                messagebox.showerror("Setup",
+                                     f"File not found:\n  {path}")
+                return
+
         try:
             self.mgr = SetupManager(path)
         except Exception as e:
             messagebox.showerror("Setup", f"Failed to load: {e}")
             return
-        car = self.mgr.setup.get("carName", "unknown")
-        self.car_var.set(f"Car: {car}")
-        self._set_status(f"Loaded {os.path.basename(path)}")
+
+        car_in_file = self.mgr.setup.get("carName", "unknown")
+        # Sync the dropdown if the file declares a different car.
+        for label, cid in self._car_id_by_label.items():
+            if cid == car_in_file:
+                self.car_var.set(label)
+                break
+
+        kind = "base setup" if using_base else "explicit setup"
+        self.loaded_setup_var.set(
+            f"{car_display_name(car_in_file)}\n"
+            f"({kind}: {os.path.basename(path)})"
+        )
+        self._set_status(f"Loaded {os.path.basename(path)} — "
+                         f"{car_display_name(car_in_file)}.")
         self._refresh_queue()
-        if car != "porsche_992_gt3_r":
-            messagebox.showwarning(
-                "Car mismatch",
-                f"Loaded car is '{car}'. Defaults are tuned for the "
-                f"Porsche 992 GT3 R; per-car rates may differ.",
-            )
 
     def _load_csv(self) -> None:
         path = self.csv_path_var.get().strip()
@@ -1224,6 +1459,62 @@ class SetupOptimizerApp:
         self.selected_corner_var.set("")
         self.map.set_track(track)
         self.map.set_issue_annotations({})
+
+    def _tune_for_track(self) -> None:
+        """Apply the selected track's theoretical-fastest baseline tuning.
+        Shows a confirmation preview listing every adjustment + reason
+        before queueing — so the user can read the engineer's logic and
+        bail if they disagree with any of it."""
+        if not self._require_setup():
+            return
+        if not self.current_track:
+            messagebox.showinfo("Tune for track",
+                                "Pick a track from the dropdown first.")
+            return
+
+        profile = TRACK_TUNING_PROFILES.get(self.current_track)
+        if not profile:
+            messagebox.showinfo(
+                "Tune for track",
+                f"No track baseline defined for '{self.current_track}'.\n"
+                f"Add it to TRACK_TUNING_PROFILES in setup_optimizer.py if "
+                f"you want one.",
+            )
+            return
+
+        # Build a preview grouped by adjustment with reason.
+        preview = []
+        for target_key, delta, reason in profile["adjustments"]:
+            if delta == 0:
+                continue
+            spec = SetupManager.TUNE_TARGETS.get(target_key)
+            if spec is None:
+                continue
+            _, _, label = spec
+            sign = "+" if delta > 0 else ""
+            preview.append(f"  • {label}: {sign}{delta} clicks — {reason}")
+
+        if not preview:
+            messagebox.showinfo("Tune for track",
+                                "This profile has no adjustments to apply.")
+            return
+
+        msg = (
+            f"Track baseline for {self.current_track.upper()}\n"
+            f"({profile['label']})\n\n"
+            f"This will queue {len(preview)} adjustment(s):\n\n"
+            + "\n".join(preview) +
+            "\n\nProceed?"
+        )
+        if not messagebox.askyesno("Tune toward track-optimal", msg):
+            return
+
+        n = self.mgr.apply_track_tuning(self.current_track)
+        self._refresh_queue()
+        self._set_status(
+            f"Track baseline applied: {n} adjustment(s) queued for "
+            f"{self.current_track.upper()}."
+        )
 
     # ---- chart range handlers ----
     def _on_chart_range(self, start_d: float, end_d: float) -> None:
@@ -1346,40 +1637,95 @@ class SetupOptimizerApp:
         # anyway so the user still sees the corner identified.
         return best
 
-    def _run_analysis(self) -> None:
-        if self.tel is None:
-            messagebox.showinfo("Analysis", "Load a MoTeC telemetry file first.")
-            return
+    def _select_all_laps(self) -> None:
+        """Select every lap in the listbox, then re-run analysis."""
+        size = self.lap_listbox.size()
+        if size:
+            self.lap_listbox.selection_set(0, size - 1)
+        self._run_analysis()
 
-        # Populate the lap dropdown the first time, or when laps are unknown.
-        self._lap_ranges = self.tel.detect_laps()
-        labels = []
+    def _refresh_lap_listbox(self) -> None:
+        """Rebuild the lap listbox from self._lap_ranges. Preserves the
+        current selection where possible."""
+        self.lap_listbox.delete(0, "end")
         for i, (s, e) in enumerate(self._lap_ranges, 1):
             ds = self.tel.df["Distance"].iloc[s]
             de = self.tel.df["Distance"].iloc[e]
-            labels.append(f"Lap {i} ({ds:.0f}–{de:.0f}m, {e - s + 1} samples)")
-        self.lap_combo.configure(values=labels)
-        if not labels:
+            label = (f"Lap {i}  ({ds:.0f}–{de:.0f}m, "
+                     f"{e - s + 1} samples)")
+            # Add lap time if Time channel is available.
+            if "Time" in self.tel.df.columns:
+                t0 = self.tel.df["Time"].iloc[s]
+                t1 = self.tel.df["Time"].iloc[e]
+                dt = t1 - t0
+                if 0 < dt < 600:    # only show if it looks plausible
+                    minutes = int(dt // 60)
+                    seconds = dt - minutes * 60
+                    label += f" — {minutes}:{seconds:06.3f}"
+            self.lap_listbox.insert("end", label)
+
+    def _run_analysis(self) -> None:
+        if self.tel is None:
+            messagebox.showinfo("Analysis",
+                                "Load a MoTeC telemetry file first.")
+            return
+
+        # Detect laps + populate the listbox if it hasn't been done yet.
+        self._lap_ranges = self.tel.detect_laps()
+        if not self._lap_ranges:
             self._set_status("Telemetry has no usable rows.")
             return
-        if self.lap_var.get() not in labels:
-            self.lap_var.set(labels[0])
-        lap_idx = labels.index(self.lap_var.get())
+        if self.lap_listbox.size() != len(self._lap_ranges):
+            self._refresh_lap_listbox()
+            # Default-select the first lap so the user has a sane starting
+            # point even before they touch the listbox.
+            if not self.lap_listbox.curselection():
+                self.lap_listbox.selection_set(0)
 
-        results = self.tel.analyze(lap_range=self._lap_ranges[lap_idx])
-        self._analysis_results = results
-        n_rows = self._populate_issues_tree(results,
-                                            scope_label=f"lap {lap_idx + 1}")
+        # Resolve which laps the user wants to analyse.
+        sel = self.lap_listbox.curselection()
+        if not sel:
+            sel = (0,)
+            self.lap_listbox.selection_set(0)
+        lap_indices = list(sel)
 
-        # Update the chart so the user can see the current lap.
-        s, e = self._lap_ranges[lap_idx]
+        # Aggregate corners across all selected laps.
+        all_results: list[dict] = []
+        for lap_idx in lap_indices:
+            sub = self.tel.analyze(lap_range=self._lap_ranges[lap_idx])
+            for c in sub:
+                # Tag corner with its lap of origin so the user can tell
+                # them apart in the issues table.
+                c["lap"] = lap_idx + 1
+                # Stable global index across all laps (1-based).
+                c["index"] = len(all_results) + 1
+                all_results.append(c)
+
+        # Pre-compute diagnose() per issue so the Treeview shows top-fix
+        # + confidence without further clicks.
+        for c in all_results:
+            c["diagnoses"] = {}
+            for phase, issue, _ev in c["issues"]:
+                c["diagnoses"][f"{phase}|{issue}"] = self.tel.diagnose(
+                    c, issue, phase)
+
+        self._analysis_results = all_results
+        scope = (f"lap {lap_indices[0] + 1}"
+                 if len(lap_indices) == 1
+                 else f"{len(lap_indices)} laps")
+        n_rows = self._populate_issues_tree(all_results, scope_label=scope)
+
+        # Update the chart with the FIRST selected lap as the displayed
+        # window (multi-lap chart overlay would be next-level work).
+        first_lap = lap_indices[0]
+        s, e = self._lap_ranges[first_lap]
         self.chart.set_data(self.tel.df.iloc[s:e + 1].reset_index(drop=True),
                             self.chart_channel_var.get())
         self.chart.clear_selection()
 
-        n_corners = len(results)
-        self._set_status(f"Analysis: {n_corners} corners, {n_rows} issues "
-                         f"flagged on lap {lap_idx + 1}.")
+        n_corners = len(all_results)
+        self._set_status(f"Analysis: {n_corners} corners across {scope}, "
+                         f"{n_rows} issue(s) flagged.")
         if n_rows == 0:
             self.validation_var.set(
                 "No handling issues detected on this lap. "
@@ -1390,7 +1736,13 @@ class SetupOptimizerApp:
     def _populate_issues_tree(self, results: list[dict],
                               scope_label: str = "") -> int:
         """Replace the Treeview with rows from `results` and update the map
-        annotations. Returns the number of rows inserted."""
+        annotations. Returns the number of rows inserted.
+
+        Each row reads its top-fix label + confidence from the cached
+        ``corner['diagnoses']`` dict (computed in `_run_analysis` and
+        `_diagnose_driver_input`) so the user can scan the recommendation
+        at a glance.
+        """
         self.issues_tree.delete(*self.issues_tree.get_children())
         annotations: dict[str, str] = {}
         priority = {"Bottoming": 4, "Oversteer": 3,
@@ -1400,23 +1752,31 @@ class SetupOptimizerApp:
             named = self._map_corner_to_named(c["start_dist"], c["end_dist"])
             corner_label = (named
                             or f"{c['start_dist']:.0f}-{c['end_dist']:.0f}m")
+            lap_label = f"L{c.get('lap', 1)}"
+            diagnoses = c.get("diagnoses", {})
             for phase, issue, _evidence in c["issues"]:
-                m = c["metrics"]
+                diag = diagnoses.get(f"{phase}|{issue}")
+                if diag is None and self.tel:
+                    diag = self.tel.diagnose(c, issue, phase)
+                    diagnoses[f"{phase}|{issue}"] = diag
+                top_label = ""
+                conf_str = "—"
+                if diag and diag["fixes"]:
+                    top = diag["fixes"][0]
+                    top_label = top["label"]
+                    conf_str = f"{int(round(top['score'] * 100))}%"
                 self.issues_tree.insert(
                     "", "end",
                     iid=f"{c['index']}|{phase}|{issue}",
-                    values=(
-                        corner_label, phase, issue,
-                        f"{m['min_speed']:.0f}" if m.get("min_speed") else "—",
-                        f"{m['peak_glat']:.2f}" if m.get("peak_glat") else "—",
-                        f"{m['peak_brake']:.0f}" if m.get("peak_brake") else "—",
-                    ),
+                    values=(lap_label, corner_label, phase, issue,
+                            conf_str, top_label),
                 )
                 n_rows += 1
                 if (corner_label not in annotations
                         or priority.get(issue, 0)
                         > priority.get(annotations[corner_label], 0)):
                     annotations[corner_label] = issue
+            c["diagnoses"] = diagnoses
         # Filter map annotations to corners that actually have markers.
         if self.current_track and self.current_track in TRACK_LAYOUTS:
             track_corners = set(
@@ -1495,22 +1855,26 @@ class SetupOptimizerApp:
             self.fix_reason_var.set("→ " + fixes[idx]["reason"])
 
     # ---- driver-input diagnosis ----
-    def _on_driver_issue_change(self) -> None:
-        """Disable the Phase radios when the issue is whole-corner only."""
-        issue = self.driver_issue_var.get()
-        state = ("normal" if issue in ("Understeer", "Oversteer")
-                 else "disabled")
-        for rb in self._driver_phase_buttons:
-            rb.configure(state=state)
+    def _clear_complaints(self) -> None:
+        """Untick every complaint and reset severity sliders to 3."""
+        for data in self._complaints.values():
+            data["checked"].set(False)
+            data["severity"].set(3)
 
     def _diagnose_driver_input(self) -> None:
-        """Driver-driven diagnosis: take the chart range + issue/phase
-        radios, then run the analyzer + diagnose() and put one row into the
-        issues Treeview so the user can apply a fix."""
+        """Driver-driven diagnosis: take the chart range + every ticked
+        complaint in the grid, run the telemetry analyzer + diagnose() for
+        each, and put one row per complaint into the issues Treeview.
+
+        This lets the driver report compound problems on the same corner —
+        e.g. "understeer on entry + instability mid + oversteer on exit" —
+        and get a separate ranked fix list for each phase/issue combination.
+        """
         if self.tel is None:
             messagebox.showinfo("Diagnose",
                                 "Load a MoTeC telemetry file first.")
             return
+
         s, e = self.chart.get_selection()
         if s is None or e is None:
             try:
@@ -1528,35 +1892,52 @@ class SetupOptimizerApp:
                                 "The selected range is too small (<10m).")
             return
 
+        # Collect every ticked complaint with its severity rating.
+        ticked: list[tuple[str, str, int]] = []
+        for (issue, phase), data in self._complaints.items():
+            if data["checked"].get():
+                ticked.append((issue, phase, int(data["severity"].get())))
+        if not ticked:
+            messagebox.showinfo(
+                "Diagnose",
+                "Tick at least one complaint first.\n\n"
+                "You can tick multiple — each one becomes its own row "
+                "with its own severity, fix list, and click multiplier.",
+            )
+            return
+
         corner = self.tel.analyze_range(s, e)
         if corner is None:
             messagebox.showinfo(
                 "Diagnose",
                 "Not enough samples in the selected range to analyze.")
             return
+        corner["lap"] = "U"   # 'U' = user-reported
 
-        issue = self.driver_issue_var.get()
-        phase = (self.driver_phase_var.get()
-                 if issue in ("Understeer", "Oversteer") else "Corner")
+        corner["issues"] = []
+        corner["diagnoses"] = {}
+        corner["severity"] = {}
+        for issue, phase, severity in ticked:
+            phase_text = phase.lower() if phase != "Corner" else "the corner"
+            evidence = (f"Driver-reported {issue.lower()} on {phase_text} "
+                        f"({s:.0f}-{e:.0f}m, severity {severity}/5).")
+            corner["issues"].append((phase, issue, evidence))
+            corner["diagnoses"][f"{phase}|{issue}"] = self.tel.diagnose(
+                corner, issue, phase)
+            corner["severity"][f"{phase}|{issue}"] = severity
 
-        # Overwrite the corner's classified issues with the driver's call so
-        # the Treeview shows a single row reflecting their input.
-        corner["issues"] = [(
-            phase, issue,
-            f"Driver-reported {issue.lower()} on {s:.0f}-{e:.0f}m.",
-        )]
         self._analysis_results = [corner]
-        n = self._populate_issues_tree([corner],
-                                       scope_label="driver-input range")
+        self._populate_issues_tree([corner],
+                                   scope_label="driver-input range")
         self.chart.set_selection(s, e)
 
         children = self.issues_tree.get_children()
         if children:
             self.issues_tree.selection_set(children[0])
-            self._on_issue_select()  # this triggers diagnose()
+            self._on_issue_select()
         self._set_status(
-            f"Diagnosed driver-reported {issue} @ {phase} on "
-            f"{s:.0f}-{e:.0f}m — {n} fix list ranked by telemetry."
+            f"Diagnosed {len(ticked)} driver-reported issue(s) on "
+            f"{s:.0f}-{e:.0f}m — severities {sorted(s for _,_,s in ticked)}."
         )
 
     def _apply_selected_telem(self) -> None:
@@ -1577,45 +1958,100 @@ class SetupOptimizerApp:
         # Snapshot driver-side context so the apply header reads right.
         self.issue_var.set(self._current_diagnosis["issue"])
         self.phase_var.set(self._current_diagnosis["phase"])
-        self._apply_fix([(fx["label"], fx["method"])])
+
+        # Look up the severity the driver dialled in for this complaint
+        # (auto-detected issues default to severity 1).
+        severity = 1
+        if self._selected_corner_dict:
+            phase = self._current_diagnosis["phase"]
+            issue = self._current_diagnosis["issue"]
+            severity = (self._selected_corner_dict.get("severity", {})
+                        .get(f"{phase}|{issue}", 1))
+
+        self._apply_fix([(fx["label"], fx["method"])], severity=severity)
         self._set_status(
             f"Applied [{int(round(fx['score']*100))}%] {fx['label']} "
-            f"for {self.current_corner}."
+            f"for {self.current_corner} (severity {severity}/5)."
         )
 
     def _apply_all_detected(self) -> None:
         """Apply the TOP-RANKED fix (per telemetry) for every detected
-        issue across all corners."""
+        issue. Shows a confirmation dialog listing what will be applied so
+        the user can sanity-check before queueing N adjustments at once."""
         if not self._require_setup():
             return
         if not self._analysis_results:
-            messagebox.showinfo("Apply",
-                                "No analysis results yet — click Run analysis.")
+            messagebox.showinfo("Apply ALL top fixes",
+                                "Run 'Auto-diagnose telemetry' first.")
             return
+
+        # Collect everything that would be applied. Each plan entry carries
+        # its severity so a 5/5 severe complaint applies more clicks than
+        # a 1/5 mild one.
+        plan: list[tuple[dict, str, str, dict, int]] = []
+        for corner in self._analysis_results:
+            diagnoses = corner.get("diagnoses", {})
+            severities = corner.get("severity", {})
+            for phase, issue, _ev in corner["issues"]:
+                diag = diagnoses.get(f"{phase}|{issue}")
+                if diag is None and self.tel:
+                    diag = self.tel.diagnose(corner, issue, phase)
+                if diag and diag["fixes"]:
+                    sev = severities.get(f"{phase}|{issue}", 1)
+                    plan.append((corner, phase, issue, diag["fixes"][0], sev))
+
+        if not plan:
+            messagebox.showinfo("Apply ALL top fixes",
+                                "No issues with applicable fixes were "
+                                "found in the current analysis.")
+            return
+
+        # Build a human-readable preview that includes severity.
+        preview_lines = []
+        for corner, phase, issue, top, sev in plan[:12]:
+            named = self._map_corner_to_named(corner["start_dist"],
+                                              corner["end_dist"])
+            cname = named or f"C{corner['index']}"
+            pct = int(round(top["score"] * 100))
+            mult = SetupManager.SEVERITY_TO_CLICKS.get(sev, 1)
+            sev_tag = f"  [sev {sev}/5 → ×{mult}]" if sev != 1 else ""
+            preview_lines.append(
+                f"  • {cname} — {phase} {issue}: "
+                f"[{pct}%] {top['label']}{sev_tag}"
+            )
+        more = ""
+        if len(plan) > 12:
+            more = f"\n  … and {len(plan) - 12} more."
+        msg = (
+            f"This will queue {len(plan)} setup adjustment(s):\n\n"
+            + "\n".join(preview_lines) + more +
+            "\n\nProceed?"
+        )
+        if not messagebox.askyesno("Apply ALL top fixes", msg):
+            return
+
         original_issue = self.issue_var.get()
         original_phase = self.phase_var.get()
         original_corner = self.current_corner
 
         applied = 0
-        for corner in self._analysis_results:
-            named = self._map_corner_to_named(corner["start_dist"], corner["end_dist"])
+        for corner, phase, issue, top, sev in plan:
+            named = self._map_corner_to_named(corner["start_dist"],
+                                              corner["end_dist"])
             self.current_corner = (named
                                    or f"C{corner['index']} ({corner['start_dist']:.0f}m)")
-            for phase, issue, _ev in corner["issues"]:
-                self.issue_var.set(issue)
-                if phase in ("Entry", "Mid", "Exit"):
-                    self.phase_var.set(phase)
-                diag = self.tel.diagnose(corner, issue, phase)
-                if diag["fixes"]:
-                    top = diag["fixes"][0]
-                    self._apply_fix([(top["label"], top["method"])])
-                    applied += 1
+            self.issue_var.set(issue)
+            if phase in ("Entry", "Mid", "Exit"):
+                self.phase_var.set(phase)
+            self._apply_fix([(top["label"], top["method"])], severity=sev)
+            applied += 1
 
         self.issue_var.set(original_issue)
         self.phase_var.set(original_phase)
         self.current_corner = original_corner
-        self._set_status(f"Auto-apply complete: {applied} telemetry-ranked "
-                         f"fix(es) queued.")
+        self._set_status(
+            f"Applied {applied} telemetry-ranked fix(es) — review the queue."
+        )
 
     # ---- validation ----
     def _validate(self) -> None:
@@ -1676,18 +2112,28 @@ class SetupOptimizerApp:
             return
         self._apply_fix(recs)
 
-    def _apply_fix(self, recs: list[tuple[str, str]]) -> None:
+    def _apply_fix(self, recs: list[tuple[str, str]],
+                   severity: int = 1) -> None:
+        """Queue Driver61 fixes. The severity (1-5) translates into a click
+        multiplier via SetupManager.SEVERITY_TO_CLICKS, so a "5/5 severe"
+        understeer hits with 4 clicks of every fix instead of just 1."""
         track = (self.current_track or "?").upper()
         corner = self.current_corner or "?"
         issue = self.issue_var.get()
         phase = self._phase_for_lookup()
-        header = f"\n{track} — {corner} — {issue} @ {phase}"
+        multiplier = SetupManager.SEVERITY_TO_CLICKS.get(int(severity), 1)
+        sev_tag = (f"  [severity {severity}/5 → ×{multiplier}]"
+                   if severity != 1 else "")
+        header = f"\n{track} — {corner} — {issue} @ {phase}{sev_tag}"
         self.mgr.changes.append(header)
-        for _, method_name in recs:
-            getattr(self.mgr, method_name)()
+
+        with self.mgr.adjustment_scale(multiplier):
+            for _, method_name in recs:
+                getattr(self.mgr, method_name)()
         self._refresh_queue()
         self._set_status(f"Applied {len(recs)} adjustment(s) for "
-                         f"{issue} @ {phase} on {corner}.")
+                         f"{issue} @ {phase} on {corner} "
+                         f"(severity {severity}/5).")
 
     # ---- queue / save / reset ----
     def _refresh_queue(self) -> None:

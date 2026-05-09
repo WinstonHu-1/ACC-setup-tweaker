@@ -19,14 +19,103 @@ race engineer can iterate.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import os
+import shutil
 import sys
 from dataclasses import dataclass, field
 from typing import Any
 
 import pandas as pd
+
+
+# ---------------------------------------------------------------------------
+# Car registry — base_setups/<carName>.json
+# ---------------------------------------------------------------------------
+# Each file in base_setups/ is a "factory" setup for one car. A user can
+# add a new car by uploading any setup with a `carName` field; we copy it
+# into base_setups/<carName>.json. The GUI's car dropdown is built from
+# this directory.
+BASE_SETUPS_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "base_setups"
+)
+
+# Pretty display names for ACC car codes. Falls back to title-casing the
+# code if the car isn't listed here.
+CAR_DISPLAY_NAMES: dict[str, str] = {
+    "porsche_992_gt3_r":     "Porsche 992 GT3 R",
+    "porsche_991ii_gt3_r":   "Porsche 991 II GT3 R",
+    "ferrari_296_gt3":       "Ferrari 296 GT3",
+    "ferrari_488_gt3_evo":   "Ferrari 488 GT3 Evo",
+    "ferrari_488_gt3":       "Ferrari 488 GT3",
+    "audi_r8_lms_evo_ii":    "Audi R8 LMS Evo II",
+    "audi_r8_lms_evo":       "Audi R8 LMS Evo",
+    "audi_r8_lms":           "Audi R8 LMS",
+    "bmw_m4_gt3":            "BMW M4 GT3",
+    "bmw_m6_gt3":            "BMW M6 GT3",
+    "amg_gt3_evo":           "Mercedes-AMG GT3 Evo",
+    "amg_gt3":               "Mercedes-AMG GT3",
+    "mclaren_720s_gt3_evo":  "McLaren 720S GT3 Evo",
+    "mclaren_720s_gt3":      "McLaren 720S GT3",
+    "lamborghini_huracan_gt3_evo2": "Lamborghini Huracán GT3 Evo 2",
+    "lamborghini_huracan_gt3_evo":  "Lamborghini Huracán GT3 Evo",
+    "honda_nsx_gt3_evo":     "Honda NSX GT3 Evo",
+    "lexus_rc_f_gt3":        "Lexus RC F GT3",
+    "aston_martin_v8_vantage_gt3":  "Aston Martin V8 Vantage GT3",
+    "nissan_gt_r_gt3_2018":  "Nissan GT-R GT3 (2018)",
+    "ford_mustang_gt3":      "Ford Mustang GT3",
+}
+
+
+def car_display_name(car_id: str) -> str:
+    """Pretty name for a car-id. Falls back to a title-cased version."""
+    if car_id in CAR_DISPLAY_NAMES:
+        return CAR_DISPLAY_NAMES[car_id]
+    return car_id.replace("_", " ").title()
+
+
+def list_base_setups() -> dict[str, str]:
+    """Return ``{car_id: path_to_base_setup_json}`` for everything in
+    base_setups/. Files without a carName field are skipped."""
+    out: dict[str, str] = {}
+    if not os.path.isdir(BASE_SETUPS_DIR):
+        return out
+    for fname in sorted(os.listdir(BASE_SETUPS_DIR)):
+        if not fname.lower().endswith(".json"):
+            continue
+        path = os.path.join(BASE_SETUPS_DIR, fname)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        car_id = data.get("carName")
+        if not car_id:
+            continue
+        # Prefer the first file we find for a given car_id (sorted order).
+        out.setdefault(car_id, path)
+    return out
+
+
+def add_base_setup(setup_path: str) -> str:
+    """Register a setup as the base for its declared car. Copies the file
+    into base_setups/<carName>.json and returns the car_id.
+
+    Raises ValueError if the file has no carName, or OSError on copy fail.
+    """
+    with open(setup_path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    car_id = data.get("carName")
+    if not car_id:
+        raise ValueError("Setup has no 'carName' field — can't register it.")
+
+    os.makedirs(BASE_SETUPS_DIR, exist_ok=True)
+    dest = os.path.join(BASE_SETUPS_DIR, f"{car_id}.json")
+    if os.path.abspath(setup_path) != os.path.abspath(dest):
+        shutil.copy2(setup_path, dest)
+    return car_id
 
 
 # ---------------------------------------------------------------------------
@@ -999,39 +1088,72 @@ class SetupManager:
     """Reads, modifies, and writes an ACC setup.json. Tracks every adjustment
     for the engineering report at the end of the session."""
 
+    # Severity → click multiplier for the user's complaint sliders.
+    # The mapping is intentionally non-linear so a 1/5 mild call produces
+    # a single click (Driver61's recommended unit step) and a 5/5 severe
+    # call only goes up to 4 clicks (multi-mm ride-height moves are rare
+    # even on truly broken setups).
+    SEVERITY_TO_CLICKS: dict[int, int] = {
+        1: 1, 2: 1, 3: 2, 4: 3, 5: 4,
+    }
+
     def __init__(self, json_path: str) -> None:
         self.json_path = json_path
         with open(json_path, "r", encoding="utf-8") as fh:
             self.setup: dict[str, Any] = json.load(fh)
         self.original = copy.deepcopy(self.setup)
         self.changes: list[str] = []
+        # Click multiplier honoured by every _adj_* call. Driven by the
+        # severity slider in the GUI via `adjustment_scale` below — defaults
+        # to 1 so legacy callers keep their old single-click behaviour.
+        self._click_multiplier: int = 1
+
+    @contextlib.contextmanager
+    def adjustment_scale(self, multiplier: int):
+        """Within the with-block, multiply every click delta by `multiplier`.
+        Restored on exit. Use ``SEVERITY_TO_CLICKS[severity]`` to translate
+        a 1-5 severity rating into a multiplier.
+        """
+        old = self._click_multiplier
+        self._click_multiplier = max(1, int(multiplier))
+        try:
+            yield
+        finally:
+            self._click_multiplier = old
 
     # ---- low-level helpers -----------------------------------------------
     def _adj_array(self, path: list[str], indices: list[int], delta: int,
                    label: str, reason: str) -> None:
-        """Adjust selected indices in an array-valued field by `delta` clicks."""
+        """Adjust selected indices in an array-valued field by `delta`
+        clicks (scaled by the active severity multiplier)."""
+        scaled = delta * self._click_multiplier
         node = self.setup
         for key in path[:-1]:
             node = node[key]
         arr = node[path[-1]]
         before = list(arr)
         for i in indices:
-            arr[i] = max(0, arr[i] + delta)  # clicks can't go below 0
+            arr[i] = max(0, arr[i] + scaled)   # clicks can't go below 0
         after = list(arr)
+        sev_note = (f"  [severity ×{self._click_multiplier}]"
+                    if self._click_multiplier > 1 else "")
         self.changes.append(
-            f"  • {label}: {before} → {after}  ({delta:+d} clicks on idx {indices})\n"
+            f"  • {label}: {before} → {after}  ({scaled:+d} clicks on idx {indices}){sev_note}\n"
             f"      Why: {reason}"
         )
 
     def _adj_scalar(self, path: list[str], delta: int, label: str, reason: str) -> None:
+        scaled = delta * self._click_multiplier
         node = self.setup
         for key in path[:-1]:
             node = node[key]
         before = node[path[-1]]
-        node[path[-1]] = max(0, before + delta)
+        node[path[-1]] = max(0, before + scaled)
         after = node[path[-1]]
+        sev_note = (f"  [severity ×{self._click_multiplier}]"
+                    if self._click_multiplier > 1 else "")
         self.changes.append(
-            f"  • {label}: {before} → {after}  ({delta:+d} clicks)\n"
+            f"  • {label}: {before} → {after}  ({scaled:+d} clicks){sev_note}\n"
             f"      Why: {reason}"
         )
 
@@ -1183,13 +1305,17 @@ class SetupManager:
         )
 
     def more_caster(self) -> None:
+        delta = 1 * self._click_multiplier
         before_lf = self.setup["basicSetup"]["alignment"]["casterLF"]
         before_rf = self.setup["basicSetup"]["alignment"]["casterRF"]
-        self.setup["basicSetup"]["alignment"]["casterLF"] = before_lf + 1
-        self.setup["basicSetup"]["alignment"]["casterRF"] = before_rf + 1
+        self.setup["basicSetup"]["alignment"]["casterLF"] = before_lf + delta
+        self.setup["basicSetup"]["alignment"]["casterRF"] = before_rf + delta
+        sev_note = (f"  [severity ×{self._click_multiplier}]"
+                    if self._click_multiplier > 1 else "")
         self.changes.append(
             f"  • Caster: ({before_lf}, {before_rf}) → "
-            f"({before_lf + 1}, {before_rf + 1})  (+1 click each)\n"
+            f"({before_lf + delta}, {before_rf + delta})  "
+            f"(+{delta} click each){sev_note}\n"
             "      Why: More caster → more dynamic camber under steering → "
             "more front grip mid/exit AND stronger self-centring → straight-line stability."
         )
@@ -1291,6 +1417,70 @@ class SetupManager:
             "instead of transmitting them to the chassis → car settles faster.",
         )
 
+    # ---- track-baseline tuning (theoretical-fastest direction) ------------
+    # Keys are the same track strings as TRACK_LAYOUTS in the GUI. Each
+    # entry maps a target name to (json_path, indices_or_None, label).
+    # Indices = None ⇒ scalar field; otherwise apply to those array indices.
+    TUNE_TARGETS: dict[str, tuple[list[str], list[int] | None, str]] = {
+        "rearWing":         (["advancedSetup", "aeroBalance", "rearWing"],
+                             None, "Rear wing"),
+        "rideHeight":       (["advancedSetup", "aeroBalance", "rideHeight"],
+                             [0, 1, 2, 3], "Ride height (all)"),
+        "frontRideHeight":  (["advancedSetup", "aeroBalance", "rideHeight"],
+                             [0, 1], "Front ride height"),
+        "rearRideHeight":   (["advancedSetup", "aeroBalance", "rideHeight"],
+                             [2, 3], "Rear ride height"),
+        "aRBFront":         (["advancedSetup", "mechanicalBalance", "aRBFront"],
+                             None, "Front anti-roll bar"),
+        "aRBRear":          (["advancedSetup", "mechanicalBalance", "aRBRear"],
+                             None, "Rear anti-roll bar"),
+        "preload":          (["advancedSetup", "drivetrain", "preload"],
+                             None, "Differential preload"),
+        "brakeBias":        (["advancedSetup", "mechanicalBalance", "brakeBias"],
+                             None, "Brake bias"),
+        "frontBumpSlow":    (["advancedSetup", "dampers", "bumpSlow"],
+                             [0, 1], "Front bump (slow)"),
+        "frontReboundSlow": (["advancedSetup", "dampers", "reboundSlow"],
+                             [0, 1], "Front rebound (slow)"),
+        "bumpStopWindow":   (["advancedSetup", "mechanicalBalance",
+                              "bumpStopWindow"], [0, 1, 2, 3],
+                             "Bumpstop window"),
+    }
+
+    def apply_track_tuning(self, track_key: str) -> int:
+        """Move the setup toward the engineering baseline for this track.
+
+        Each track's profile is a small list of click deltas on aero,
+        mechanical balance, dampers and diff — the same parameters i2 Pro
+        engineers tweak when moving between low-downforce (Monza) and
+        high-downforce (Hungaroring) circuits. Conservative numbers
+        (1-4 clicks) so it nudges, not slams, the setup.
+
+        Returns the number of adjustments queued in `self.changes`.
+        """
+        profile = TRACK_TUNING_PROFILES.get(track_key.lower())
+        if not profile:
+            return 0
+
+        self.changes.append(
+            f"\n[TRACK BASELINE — {track_key.upper()}: "
+            f"{profile['label']}]"
+        )
+        applied = 0
+        for target_key, delta, reason in profile["adjustments"]:
+            if delta == 0:
+                continue
+            spec = self.TUNE_TARGETS.get(target_key)
+            if spec is None:
+                continue
+            path, indices, label = spec
+            if indices is None:
+                self._adj_scalar(path, delta, label, reason)
+            else:
+                self._adj_array(path, indices, delta, label, reason)
+            applied += 1
+        return applied
+
     # ---- save ------------------------------------------------------------
     def save(self, out_path: str) -> None:
         with open(out_path, "w", encoding="utf-8") as fh:
@@ -1352,6 +1542,204 @@ RECOMMENDATIONS: dict[tuple[str, str], list[tuple[str, str]]] = {
         ("Increase bumpstop range",     "increase_bumpstop_range"),
         ("Reduce fast bump",            "reduce_fast_bump"),
     ],
+}
+
+
+# ---------------------------------------------------------------------------
+# Track tuning profiles — "theoretical-fastest" baselines per ACC track.
+# ---------------------------------------------------------------------------
+# Each profile is a list of (target, delta_clicks, reason) tuples. Targets
+# resolve via SetupManager.TUNE_TARGETS to a JSON path + indices. The deltas
+# are intentionally small (1-4 clicks) so the result NUDGES the setup
+# toward the track's known engineering preference rather than rewriting it.
+#
+# Engineering rationale per category:
+#   - Top-speed tracks (long straights)    → less wing, lower diff preload
+#   - Slow technical tracks                → more wing, stiffer ARBs
+#   - Bumpy / kerby tracks                 → higher RH, wider bumpstop window
+#   - Smooth tracks                        → lower RH for aero gain
+#   - Heavy braking zones                  → more rearward brake bias
+TRACK_TUNING_PROFILES: dict[str, dict] = {
+    "monza": {
+        "label": "Low downforce — long straights, three chicanes",
+        "adjustments": [
+            ("rearWing",  -4, "Long straights — every wing click costs ~0.5 km/h top speed."),
+            ("aRBFront",  -1, "Soften the front for chicane bite without snap."),
+            ("preload",   -2, "Lower preload helps the diff open in T1/T4/Ascari."),
+            ("brakeBias", -1, "Heavy late braking — rearward bias prevents front lock."),
+        ],
+    },
+    "spa": {
+        "label": "Medium downforce — fast flowing, Eau Rouge stability",
+        "adjustments": [
+            ("aRBRear",         +1, "Stiffer rear for Pouhon and Blanchimont yaw stability."),
+            ("frontRideHeight", +1, "Eau Rouge compression needs front clearance."),
+        ],
+    },
+    "hungaroring": {
+        "label": "High downforce — slow, twisty, almost no straights",
+        "adjustments": [
+            ("rearWing", +4, "Almost no straights — maximum downforce wins."),
+            ("aRBFront", +1, "Stiffer front for sharper direction changes."),
+            ("preload",  -2, "Lower preload for tight T1/T2 rotation."),
+        ],
+    },
+    "imola": {
+        "label": "Medium-high downforce — chicanes and big kerbs",
+        "adjustments": [
+            ("rearWing",       +1, "Tamburello and Acque Minerali need stable rear."),
+            ("bumpStopWindow", +2, "Variante Alta + Rivazza kerbs."),
+            ("frontBumpSlow",  +1, "Tosa heavy braking — control front dive."),
+        ],
+    },
+    "silverstone": {
+        "label": "Medium-high downforce — fast sweepers, smooth surface",
+        "adjustments": [
+            ("rearWing",   +1, "Maggotts/Becketts/Stowe load up the rear at speed."),
+            ("aRBRear",    +1, "High-speed yaw stability through Copse."),
+            ("rideHeight", -1, "Smooth surface — close to the deck for aero."),
+        ],
+    },
+    "brands hatch": {
+        "label": "High downforce — undulating GP loop, heavy kerbs",
+        "adjustments": [
+            ("rearWing",        +2, "Twisty GP loop — downforce wins."),
+            ("rearRideHeight",  +1, "Paddock Hill compression."),
+            ("bumpStopWindow",  +1, "Druids / Surtees kerbs."),
+        ],
+    },
+    "nurburgring": {
+        "label": "Medium-high downforce — twisty Sectors 2/3",
+        "adjustments": [
+            ("rearWing", +2, "Sectors 2 and 3 are very twisty."),
+            ("aRBFront", +1, "Direction changes through Mercedes Arena."),
+        ],
+    },
+    "zandvoort": {
+        "label": "High downforce — banked corners, heavy kerbs",
+        "adjustments": [
+            ("rearWing",        +3, "Banking + tight Hugenholtz/Arie Luyendyk."),
+            ("rearRideHeight",  +1, "Banking compression at Arie Luyendyk."),
+            ("bumpStopWindow",  +2, "Heavy kerb usage."),
+        ],
+    },
+    "suzuka": {
+        "label": "Medium-high downforce — esses + 130R",
+        "adjustments": [
+            ("rearWing",        +1, "Esses + Spoon need a stable rear."),
+            ("aRBFront",        +1, "Stiffer front for the esses."),
+            ("frontRideHeight", +1, "130R compression."),
+        ],
+    },
+    "misano": {
+        "label": "High downforce — slow corners, big kerbs",
+        "adjustments": [
+            ("rearWing",       +2, "Mostly slow technical sections."),
+            ("aRBFront",       +1, "Tight direction changes through Variante."),
+            ("bumpStopWindow", +2, "Heavy kerb usage."),
+        ],
+    },
+    "paul ricard": {
+        "label": "Medium downforce — long Mistral straight",
+        "adjustments": [
+            ("rearWing",   -2, "Mistral straight — drag costs lap time."),
+            ("rideHeight", -1, "Smooth surface."),
+            ("preload",    -1, "Tight infield section."),
+        ],
+    },
+    "barcelona": {
+        "label": "Medium-high downforce — abrasive, fast final corners",
+        "adjustments": [
+            ("rearWing", +1, "Long high-speed final sector."),
+            ("aRBRear",  +1, "Stable rear through T9 Campsa."),
+        ],
+    },
+    "red bull ring": {
+        "label": "Medium downforce — short, twisty, uphill",
+        "adjustments": [
+            ("rearWing", +1, "Short lap, twisty sectors."),
+            ("aRBRear",  +1, "Uphill traction out of T3."),
+            ("preload",  -1, "T3 + T9 are very tight."),
+        ],
+    },
+    "bathurst": {
+        "label": "Medium downforce — Mountain section is very bumpy",
+        "adjustments": [
+            ("rideHeight",     +2, "Very bumpy mountain section."),
+            ("bumpStopWindow", +2, "The Cutting + Skyline kerbs."),
+            ("aRBRear",        +1, "High-speed Conrod stability."),
+        ],
+    },
+    "cota": {
+        "label": "Medium-high downforce — technical esses",
+        "adjustments": [
+            ("rearWing", +2, "Slow infield needs downforce."),
+            ("aRBFront", +1, "T2-T6 esses sequence."),
+        ],
+    },
+    "donington": {
+        "label": "Medium-high downforce — technical with fast bits",
+        "adjustments": [
+            ("rearWing", +1, "Old Hairpin and Coppice need downforce."),
+            ("aRBRear",  +1, "Craner Curves stability."),
+        ],
+    },
+    "indianapolis": {
+        "label": "Medium downforce — road course inside the oval",
+        "adjustments": [
+            ("aRBRear", +1, "Long oval section needs stable rear."),
+        ],
+    },
+    "kyalami": {
+        "label": "Medium downforce — fast, undulating",
+        "adjustments": [
+            ("rearWing",   +1, "Crowthorne and Mineshaft fast corners."),
+            ("rideHeight", +1, "Some elevation/compression."),
+        ],
+    },
+    "laguna seca": {
+        "label": "Medium-high downforce — Corkscrew compression",
+        "adjustments": [
+            ("rearWing",       +2, "Tight infield corners."),
+            ("bumpStopWindow", +2, "Corkscrew compression hits suspension hard."),
+        ],
+    },
+    "oulton park": {
+        "label": "High downforce — undulating, kerb-heavy",
+        "adjustments": [
+            ("rearWing",       +2, "Tight Druids/Lodge layout."),
+            ("bumpStopWindow", +1, "Cascades + Knickerbrook elevation."),
+        ],
+    },
+    "snetterton": {
+        "label": "Medium downforce — fast, smooth",
+        "adjustments": [
+            ("rideHeight", -1, "Smooth surface."),
+            ("aRBRear",    +1, "High-speed Bomb Hole stability."),
+        ],
+    },
+    "watkins glen": {
+        "label": "Medium downforce — fast Boot section + chicane",
+        "adjustments": [
+            ("rearWing", +1, "Boot section + final chicane."),
+            ("aRBRear",  +1, "Esses stability."),
+        ],
+    },
+    "valencia": {
+        "label": "High downforce — twisty, slow infield (Ricardo Tormo)",
+        "adjustments": [
+            ("rearWing", +3, "Very twisty layout."),
+            ("aRBFront", +1, "Lots of direction changes."),
+            ("preload",  -1, "Tight slow corners."),
+        ],
+    },
+    "zolder": {
+        "label": "Medium-high downforce — narrow, technical",
+        "adjustments": [
+            ("rearWing", +2, "Tight Sterrewachtbocht and Lucienbocht."),
+            ("aRBFront", +1, "Quick chicanes."),
+        ],
+    },
 }
 
 
