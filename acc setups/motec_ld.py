@@ -45,21 +45,32 @@ import numpy as np
 import pandas as pd
 
 
-# Known MoTeC `.ld` magic numbers — both byte-orders seen in the wild, plus
-# a handful of ACC-specific variants we've observed. The parser falls back
-# to a structural scan if none of these match, so even an unknown variant
-# still loads as long as the channel-header layout is the conventional one.
-LD_MAGIC_CANDIDATES = (0xEC12CD40, 0x40CD12EC, 0x40CD0000, 0xCDEAFE00)
+# Known MoTeC `.ld` magic numbers — every variant we've seen in the wild.
+# ACC currently writes 0x00000040 (just byte 0x40 at offset 0, then zeros);
+# older MoTeC tools wrote 0xEC12CD40. The parser falls back to a structural
+# scan if none of these match, so even an unknown variant still loads as
+# long as the channel-header layout is the conventional one.
+LD_MAGIC_CANDIDATES = (
+    0x00000040,    # ACC (observed: bytes "40 00 00 00 …")
+    0xEC12CD40,    # classic MoTeC i2 Pro
+    0x40CD12EC,    # byte-swapped variant
+    0x40CD0000,
+    0xCDEAFE00,
+)
 CHANNEL_HEADER_SIZE = 0x7C   # 124 bytes
 
 
-# Constraints used by the structural scan to validate that a 124-byte chunk
-# of the file actually IS a channel header (vs random data that happens to
-# decode to something).
-_VALID_DATA_TYPES = (0, 2, 3)
-_VALID_DATA_SIZES = (2, 4, 8)
-_MAX_FREQ = 10_000
+# Constraints used to validate that a 124-byte chunk of the file actually
+# IS a channel header. ACC's exporter writes data_size=0 sometimes (the
+# decoder will derive byte-size from data_type when that happens) so the
+# size check has to allow zero.
+_VALID_DATA_TYPES = (0, 2, 3, 5, 7)   # 0=i16, 2=f32, 3=i32, 5=f64, 7=i64
+_VALID_DATA_SIZES = (0, 1, 2, 4, 8)
+_MAX_FREQ = 50_000
 _MAX_SAMPLES = 100_000_000
+
+# Map data_type → bytes-per-sample, used as a fallback when data_size=0.
+_DATA_TYPE_BYTES = {0: 2, 2: 4, 3: 4, 5: 8, 7: 8}
 
 
 @dataclass
@@ -81,7 +92,13 @@ class LDChannel:
         applying the mul/scale/dec_places conversion. Returns zeros on any
         out-of-bounds / unsupported-type condition (so a single bad channel
         never tanks the whole load)."""
-        dtype_map = {0: ("<i2", 2), 2: ("<f4", 4), 3: ("<i4", 4)}
+        dtype_map = {
+            0: ("<i2", 2),
+            2: ("<f4", 4),
+            3: ("<i4", 4),
+            5: ("<f8", 8),
+            7: ("<i8", 8),
+        }
         if self.data_type not in dtype_map:
             return np.zeros(self.n_samples, dtype=np.float64)
         dtype, byte_size = dtype_map[self.data_type]
@@ -110,40 +127,122 @@ def _read_string(buf: bytes) -> str:
 def _decode_channel_header(h: bytes) -> tuple[LDChannel, int] | None:
     """Decode a 124-byte block as a channel header. Returns the LDChannel
     and the raw next_ptr, or None if the block fails structural validation.
+
+    Two layout flavours are observed in the wild:
+
+    1. **ACC layout** (Assetto Corsa Competizione's exporter):
+        ``data_size`` at +0x14, ``frequency`` at +0x16 (NO explicit data_type,
+        always float32), name at +0x20 (16 bytes), short_name at +0x40
+        (8 bytes), unit at +0x48 (12 bytes).
+    2. **Classic MoTeC layout** (older docs / our synthetic test writer):
+        ``data_size`` at +0x14, ``data_type`` at +0x16, ``frequency`` at
+        +0x18, name at +0x22 (32 bytes), short_name at +0x42 (8 bytes),
+        unit at +0x4A (12 bytes).
+
+    We try ACC first because that's what real users are loading. If that
+    decode looks wrong (freq nonsensical or no printable name), we try the
+    classic layout.
     """
     if len(h) < CHANNEL_HEADER_SIZE:
         return None
+
     try:
-        _prev_ptr, next_ptr, data_ptr, n_samples = struct.unpack_from("<IIII", h, 0x00)
-        data_size, data_type, freq = struct.unpack_from("<HHH", h, 0x14)
-        _shift, mul, scale, dec_places = struct.unpack_from("<hhhh", h, 0x1A)
+        _prev_ptr, next_ptr, data_ptr, n_samples = struct.unpack_from(
+            "<IIII", h, 0x00)
     except struct.error:
         return None
+    if not (1 <= n_samples <= _MAX_SAMPLES):
+        return None
 
+    candidates: list[LDChannel | None] = [
+        _decode_acc_layout(h, next_ptr, data_ptr, n_samples),
+        _decode_classic_layout(h, next_ptr, data_ptr, n_samples),
+    ]
+    for ch in candidates:
+        if ch is not None:
+            return ch, next_ptr
+    return None
+
+
+def _decode_acc_layout(h: bytes, next_ptr: int, data_ptr: int,
+                       n_samples: int) -> LDChannel | None:
+    """ACC channel header — freq at +0x16, name at +0x20."""
+    try:
+        data_size = struct.unpack_from("<H", h, 0x14)[0]
+        freq = struct.unpack_from("<H", h, 0x16)[0]
+    except struct.error:
+        return None
+    if data_size not in _VALID_DATA_SIZES or not (1 <= freq <= _MAX_FREQ):
+        return None
+    # ACC always logs float32 — derive type from size.
+    type_lookup = {2: 0, 4: 2, 8: 5}
+    data_type = type_lookup.get(data_size)
+    if data_type is None:
+        return None
+
+    name = _read_string(h[0x20:0x40])
+    short_name = _read_string(h[0x40:0x48])
+    unit = _read_string(h[0x48:0x54])
+    if not _looks_like_real_channel(name, short_name, unit):
+        return None
+    if not name and short_name:
+        name = short_name
+    elif not name:
+        name = f"ch_{data_ptr:x}"
+
+    return LDChannel(
+        name=name, short_name=short_name, unit=unit,
+        frequency=freq, data_type=data_type, data_size=data_size,
+        mul=1, scale=1, dec_places=0,
+        data_offset=data_ptr, n_samples=n_samples,
+    )
+
+
+def _decode_classic_layout(h: bytes, next_ptr: int, data_ptr: int,
+                           n_samples: int) -> LDChannel | None:
+    """Classic MoTeC layout — data_type at +0x16, freq at +0x18,
+    name at +0x22."""
+    try:
+        data_size = struct.unpack_from("<H", h, 0x14)[0]
+        data_type = struct.unpack_from("<H", h, 0x16)[0]
+        freq = struct.unpack_from("<H", h, 0x18)[0]
+        _shift, mul, scale, dec_places = struct.unpack_from(
+            "<hhhh", h, 0x1A)
+    except struct.error:
+        return None
     if data_type not in _VALID_DATA_TYPES:
         return None
     if data_size not in _VALID_DATA_SIZES:
         return None
+    if data_size == 0:
+        data_size = _DATA_TYPE_BYTES.get(data_type, 4)
     if not (1 <= freq <= _MAX_FREQ):
-        return None
-    if not (1 <= n_samples <= _MAX_SAMPLES):
         return None
 
     name = _read_string(h[0x22:0x42])
     short_name = _read_string(h[0x42:0x4A])
     unit = _read_string(h[0x4A:0x56])
-
-    # Names should look ASCII-printable — filters out random data that
-    # happens to decode to a valid struct.
-    if not name or not all(32 <= ord(c) < 127 for c in name[:8]):
+    if not _looks_like_real_channel(name, short_name, unit):
         return None
+    if not name and short_name:
+        name = short_name
+    elif not name:
+        name = f"ch_{data_ptr:x}"
 
     return LDChannel(
         name=name, short_name=short_name, unit=unit,
         frequency=freq, data_type=data_type, data_size=data_size,
         mul=mul, scale=scale, dec_places=dec_places,
         data_offset=data_ptr, n_samples=n_samples,
-    ), next_ptr
+    )
+
+
+def _looks_like_real_channel(name: str, short_name: str, unit: str) -> bool:
+    """Reject random data masquerading as a channel header."""
+    blob = name + short_name + unit
+    if not blob:
+        return False
+    return any(32 <= ord(c) < 127 for c in blob[:8])
 
 
 def _walk_linked_list(data: bytes, start_ptr: int) -> list[LDChannel]:

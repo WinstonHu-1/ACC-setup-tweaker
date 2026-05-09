@@ -981,7 +981,7 @@ class SetupOptimizerApp:
                   wraplength=270).pack(anchor="w")
 
     def _build_center(self, parent: ttk.Frame) -> None:
-        ttk.Label(parent, text="Track (decorative)",
+        ttk.Label(parent, text="Track",
                   style="Header.TLabel").pack(anchor="w")
         row = ttk.Frame(parent); row.pack(fill="x", pady=(6, 8))
         ttk.Label(row, text="Track:").pack(side="left")

@@ -341,20 +341,17 @@ class TelemetryAnalyzer:
         return df
 
     def _normalise_channels(self) -> None:
-        """Rename CSV columns to our canonical names, then coerce to numeric.
+        """Rename CSV/LD columns to our canonical names, coerce to numeric,
+        normalise units (m/s² → g, m/s → km/h), and synthesise a Distance
+        channel from Speed × dt when ACC didn't log one directly.
 
-        Defends against duplicate-column corner cases that pandas hates:
-            - canonical name already present → don't rename anything else to it
-            - same alias matches twice → keep the first match
-            - any leftover duplicate column names → drop all but the first
+        Defends against duplicate-column corner cases that pandas hates.
         """
         rename: dict[str, str] = {}
         existing_cols = set(self.df.columns)
         norm_to_orig = {self._normalise(c): c for c in self.df.columns}
 
         for canonical, aliases in self.CHANNEL_ALIASES.items():
-            # If the canonical name already appears as a column (or as a
-            # rename target), don't add another mapping to it.
             if canonical in existing_cols or canonical in rename.values():
                 continue
             for alias in aliases:
@@ -365,17 +362,43 @@ class TelemetryAnalyzer:
         if rename:
             self.df = self.df.rename(columns=rename)
 
-        # Belt-and-braces: drop any duplicate columns that slipped through.
+        # Drop duplicate columns to keep pandas happy.
         if self.df.columns.duplicated().any():
             self.df = self.df.loc[:, ~self.df.columns.duplicated(keep="first")]
 
         for col in self.df.columns:
             series = self.df[col]
-            # paranoia — if duplicates SOMEHOW slipped through above, indexing
-            # by name returns a DataFrame; pick its first column.
             if isinstance(series, pd.DataFrame):
                 series = series.iloc[:, 0]
             self.df[col] = pd.to_numeric(series, errors="coerce")
+
+        # ---- Unit normalisation ----
+        # ACC's MoTeC export writes G in m/s² (peak ~25 m/s² ≈ 2.5g) but
+        # the analyzer's heuristics expect g. Convert if the magnitudes
+        # look like m/s² (anything beyond ±5 is overwhelmingly m/s²).
+        for g_col in ("G_Lat", "G_Lon"):
+            if g_col in self.df.columns:
+                peak = float(self.df[g_col].abs().max() or 0)
+                if peak > 5:
+                    self.df[g_col] = self.df[g_col] / 9.80665
+        # ACC writes Speed in m/s; convert to km/h (more readable in the
+        # chart, and consistent with what i2 Pro CSV exports use by default).
+        if "Speed" in self.df.columns:
+            peak_speed = float(self.df["Speed"].abs().max() or 0)
+            if peak_speed < 110:  # m/s — even Le Mans hypercars top out ~110 m/s
+                self.df["Speed"] = self.df["Speed"] * 3.6
+
+        # ---- Distance synthesis ----
+        # ACC's MoTeC export rarely logs a Distance channel — the chart and
+        # the auto-corner detector both need one, so we integrate Speed×dt.
+        if ("Distance" not in self.df.columns
+                and "Time" in self.df.columns
+                and "Speed" in self.df.columns):
+            dt = self.df["Time"].diff().fillna(0)
+            # Speed has been normalised to km/h above — convert back to m/s
+            # for integration so Distance is in metres.
+            speed_ms = self.df["Speed"] / 3.6
+            self.df["Distance"] = (speed_ms * dt).cumsum()
 
         if "Distance" in self.df.columns:
             self.df = self.df.dropna(subset=["Distance"]).reset_index(drop=True)
