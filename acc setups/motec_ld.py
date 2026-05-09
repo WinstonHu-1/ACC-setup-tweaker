@@ -270,46 +270,56 @@ def parse_ld(path: str) -> tuple[bytes, list[LDChannel]]:
 def ld_to_dataframe(path: str) -> pd.DataFrame:
     """Read a MoTeC .ld file and convert all channels into a single DataFrame.
 
-    Channels with different sample rates are linearly interpolated up to the
-    highest rate so they share the same time base, exactly as i2 Pro does
-    when displaying multiple channels on the same trace.
+    Channels with different sample rates are repeat-up-sampled to the highest
+    rate so they share the same time base. Duplicate names (which the
+    brute-force scanner can produce) get a numeric suffix.
     """
     blob, channels = parse_ld(path)
+    # Filter out channels we can't make sense of so they never reach pandas.
+    channels = [c for c in channels
+                if c.frequency > 0 and c.n_samples > 0]
     if not channels:
         return pd.DataFrame()
 
-    # Highest sample rate sets the master time base.
-    max_freq = max(c.frequency for c in channels if c.frequency)
-    max_n = max(c.n_samples * (max_freq // max(1, c.frequency))
+    max_freq = max(c.frequency for c in channels)
+    max_n = max(c.n_samples * max(1, max_freq // c.frequency)
                 for c in channels)
 
     frame: dict[str, np.ndarray] = {}
     for ch in channels:
-        if ch.frequency == 0 or ch.n_samples == 0:
-            continue
         try:
             values = ch.read_samples(blob)
         except Exception:
             continue
+        # Defensive: never feed pandas a 0-d array or a scalar.
+        values = np.asarray(values).ravel()
+        if values.size == 0:
+            continue
 
-        ratio = max_freq // ch.frequency if ch.frequency else 1
-        target_n = max_n
+        ratio = max(1, max_freq // ch.frequency)
         if ratio > 1:
-            # Up-sample by repeat (cheap and matches ACC's logging behaviour
-            # better than linear interpolation since channels were sampled at
-            # a fixed integer divisor of the master rate).
             values = np.repeat(values, ratio)
-        if len(values) < target_n:
-            values = np.pad(values, (0, target_n - len(values)),
+        if len(values) < max_n:
+            values = np.pad(values, (0, max_n - len(values)),
                             constant_values=np.nan)
-        elif len(values) > target_n:
-            values = values[:target_n]
+        elif len(values) > max_n:
+            values = values[:max_n]
 
-        # If two channels share a name (rare) keep the first one we saw.
-        col = ch.name or ch.short_name or f"ch{len(frame)}"
-        if col in frame:
-            col = f"{col}_{ch.short_name}"
+        # Build a unique, printable column name. The scanner sometimes turns
+        # up two headers with the same `name` field — give the second a
+        # numeric suffix so pandas doesn't see duplicate columns.
+        base = (ch.name or ch.short_name or f"ch{len(frame)}").strip()
+        base = "".join(c for c in base if c.isprintable()).strip() \
+               or f"ch{len(frame)}"
+        col = base
+        suffix = 1
+        while col in frame:
+            suffix += 1
+            col = f"{base}_{suffix}"
         frame[col] = values
+
+    if not frame:
+        return pd.DataFrame()
 
     df = pd.DataFrame(frame)
     if "Time" not in df.columns:

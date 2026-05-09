@@ -252,18 +252,41 @@ class TelemetryAnalyzer:
         return df
 
     def _normalise_channels(self) -> None:
-        """Rename CSV columns to our canonical names, then coerce to numeric."""
+        """Rename CSV columns to our canonical names, then coerce to numeric.
+
+        Defends against duplicate-column corner cases that pandas hates:
+            - canonical name already present → don't rename anything else to it
+            - same alias matches twice → keep the first match
+            - any leftover duplicate column names → drop all but the first
+        """
         rename: dict[str, str] = {}
+        existing_cols = set(self.df.columns)
         norm_to_orig = {self._normalise(c): c for c in self.df.columns}
+
         for canonical, aliases in self.CHANNEL_ALIASES.items():
+            # If the canonical name already appears as a column (or as a
+            # rename target), don't add another mapping to it.
+            if canonical in existing_cols or canonical in rename.values():
+                continue
             for alias in aliases:
                 if alias in norm_to_orig and norm_to_orig[alias] != canonical:
                     rename[norm_to_orig[alias]] = canonical
                     break
-        self.df = self.df.rename(columns=rename)
+
+        if rename:
+            self.df = self.df.rename(columns=rename)
+
+        # Belt-and-braces: drop any duplicate columns that slipped through.
+        if self.df.columns.duplicated().any():
+            self.df = self.df.loc[:, ~self.df.columns.duplicated(keep="first")]
 
         for col in self.df.columns:
-            self.df[col] = pd.to_numeric(self.df[col], errors="coerce")
+            series = self.df[col]
+            # paranoia — if duplicates SOMEHOW slipped through above, indexing
+            # by name returns a DataFrame; pick its first column.
+            if isinstance(series, pd.DataFrame):
+                series = series.iloc[:, 0]
+            self.df[col] = pd.to_numeric(series, errors="coerce")
 
         if "Distance" in self.df.columns:
             self.df = self.df.dropna(subset=["Distance"]).reset_index(drop=True)
