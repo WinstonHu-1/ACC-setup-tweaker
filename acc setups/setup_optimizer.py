@@ -1130,6 +1130,10 @@ class SetupManager:
         # severity slider in the GUI via `adjustment_scale` below — defaults
         # to 1 so legacy callers keep their old single-click behaviour.
         self._click_multiplier: int = 1
+        # Indices into `self.changes` for the active temperature-comp entry.
+        # `set_temperature` rewrites these in place rather than appending,
+        # so the queue stays clean while a slider is being dragged.
+        self._temp_change_indices: list[int] = []
 
     @contextlib.contextmanager
     def adjustment_scale(self, multiplier: int):
@@ -1260,6 +1264,78 @@ class SetupManager:
         if pit_lines:
             msg += "\n" + "\n".join(pit_lines)
         self.changes.append(msg)
+
+    def set_temperature(self,
+                        target_temp_c: float,
+                        baseline_temp_c: float | None = None,
+                        deg_c_per_click: float | None = None) -> None:
+        """Auto-set tyre pressures from BASE setup pressures + temperature
+        delta. Idempotent — calling repeatedly with the same target gives
+        the same result, so it's safe to bind to a slider that fires on
+        every drag step.
+
+        Logic:
+            base = self.original.tyrePressure  (the loaded setup, treated as
+                                                 the 20°C calibration)
+            clicks = -round((target - baseline) / rate)
+            new_pressure[i] = max(0, base[i] + clicks)
+
+        Replaces any prior temperature entry in `self.changes` so the queue
+        only ever shows one active temperature line.
+        """
+        baseline = (baseline_temp_c if baseline_temp_c is not None
+                    else self.BASELINE_AMBIENT_C)
+        if deg_c_per_click is not None:
+            rate = deg_c_per_click
+        else:
+            car = self.setup.get("carName", "")
+            rate = self.CAR_TEMP_RATES.get(car, self.DEG_C_PER_CLICK)
+
+        delta = target_temp_c - baseline
+        clicks = -int(round(delta / rate))
+
+        # Read base pressures from the snapshot we took at load time.
+        base_pressures = list(
+            self.original["basicSetup"]["tyres"]["tyrePressure"])
+        new_pressures = [max(0, p + clicks) for p in base_pressures]
+
+        # Apply absolutely (overwrite, don't accumulate).
+        arr = self.setup["basicSetup"]["tyres"]["tyrePressure"]
+        for i in range(4):
+            arr[i] = new_pressures[i]
+
+        # Mirror to every pit-stop strategy entry.
+        for stop in (self.setup.get("basicSetup", {})
+                     .get("strategy", {})
+                     .get("pitStrategy", []) or []):
+            pit_arr = stop.get("tyres", {}).get("tyrePressure")
+            if isinstance(pit_arr, list) and len(pit_arr) == 4:
+                for i in range(4):
+                    pit_arr[i] = new_pressures[i]
+
+        # Strip prior temperature-comp lines from the change log.
+        if self._temp_change_indices:
+            for idx in sorted(self._temp_change_indices, reverse=True):
+                if 0 <= idx < len(self.changes):
+                    del self.changes[idx]
+            self._temp_change_indices.clear()
+
+        # Re-append a fresh entry only when there's an actual delta.
+        if clicks != 0:
+            direction = "warmer" if delta > 0 else "cooler"
+            self._temp_change_indices.append(len(self.changes))
+            self.changes.append(
+                f"\n[TEMP COMP @ {target_temp_c:.0f}°C — "
+                f"{abs(delta):.0f}°C {direction} than {baseline:.0f}°C base]"
+            )
+            self._temp_change_indices.append(len(self.changes))
+            self.changes.append(
+                f"  • Tyre pressures: {base_pressures} → {new_pressures}  "
+                f"({clicks:+d} clicks all 4)\n"
+                f"      Why: target {target_temp_c:.1f}°C is {abs(delta):.1f}°C "
+                f"{direction} than the {baseline:.0f}°C base; "
+                f"@ ~{rate:.1f}°C per click."
+            )
 
     def reduce_front_tyre_pressure(self) -> None:
         self._adj_array(

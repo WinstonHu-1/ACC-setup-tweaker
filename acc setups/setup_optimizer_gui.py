@@ -717,7 +717,20 @@ class TelemetryChart(tk.Canvas):
                              fill="#666", font=("Helvetica", 10, "italic"))
             return
 
-        # Plot the line — sample to canvas pixel resolution to keep redraw cheap.
+        # 1. Selection rectangle is drawn FIRST (it's a solid background tint)
+        # so the trace line gets painted on top of it. The user sees both
+        # clearly without translucent stipple obscuring the data.
+        if self._sel_start_d is not None and self._sel_end_d is not None:
+            x1 = self._dist_to_x(min(self._sel_start_d, self._sel_end_d))
+            x2 = self._dist_to_x(max(self._sel_start_d, self._sel_end_d))
+            # Solid muted-orange fill — the trace line is bright cyan and
+            # will stand out clearly when drawn on top.
+            self.create_rectangle(x1, t, x2, b,
+                                  fill="#3a2614", outline=self.SEL_OUTLINE,
+                                  width=1)
+
+        # 2. The trace line — drawn ON TOP of the selection so it's never
+        # covered by the highlight.
         df = self._df
         n = len(df)
         target = max(2, r - l)
@@ -735,14 +748,10 @@ class TelemetryChart(tk.Canvas):
         if len(pts) >= 4:
             self.create_line(*pts, fill=self.LINE, width=1)
 
-        # Selection rectangle — draw under the trace would require ordering
-        # tricks; drawing on top is cheaper and still readable.
+        # 3. Selection range label, last so it sits on top of everything.
         if self._sel_start_d is not None and self._sel_end_d is not None:
             x1 = self._dist_to_x(min(self._sel_start_d, self._sel_end_d))
             x2 = self._dist_to_x(max(self._sel_start_d, self._sel_end_d))
-            self.create_rectangle(x1, t, x2, b, fill=self.SEL_OUTLINE,
-                                  stipple="gray25", outline=self.SEL_OUTLINE,
-                                  width=1)
             label = (f"{min(self._sel_start_d, self._sel_end_d):.0f} – "
                      f"{max(self._sel_start_d, self._sel_end_d):.0f} m")
             self.create_text((x1 + x2) // 2, t + 8, text=label,
@@ -882,20 +891,19 @@ class SetupOptimizerApp:
         root.rowconfigure(0, weight=1)
         root.rowconfigure(1, weight=0)
 
-        # Left and right columns get a Canvas-based vertical scroller so
-        # nothing falls off the bottom on smaller windows.
-        left_outer = ttk.Frame(root, padding=(12, 12, 0, 12))
-        left_outer.grid(row=0, column=0, sticky="nsew")
-        self.left = self._make_scrollable(left_outer)
+        # Left and right columns are fixed-height; the centre column scrolls
+        # because it carries the chart + complaint sliders + range controls.
+        self.left = ttk.Frame(root, padding=12)
+        self.left.grid(row=0, column=0, sticky="nsew")
         self._build_left(self.left)
 
-        self.center = ttk.Frame(root, padding=12)
-        self.center.grid(row=0, column=1, sticky="nsew")
+        center_outer = ttk.Frame(root, padding=(12, 12, 12, 12))
+        center_outer.grid(row=0, column=1, sticky="nsew")
+        self.center = self._make_scrollable(center_outer)
         self._build_center(self.center)
 
-        right_outer = ttk.Frame(root, padding=(0, 12, 12, 12))
-        right_outer.grid(row=0, column=2, sticky="nsew")
-        self.right = self._make_scrollable(right_outer)
+        self.right = ttk.Frame(root, padding=12)
+        self.right.grid(row=0, column=2, sticky="nsew")
         self._build_right(self.right)
 
         self.status_var = tk.StringVar(value="")
@@ -953,20 +961,31 @@ class SetupOptimizerApp:
         ttk.Button(parent, text="Clear telemetry",
                    command=self._clear_csv).pack(fill="x")
 
-        # ---- Temperature compensation ----
+        # ---- Temperature compensation (auto-applies via slider) ----
         ttk.Separator(parent).pack(fill="x", pady=10)
         ttk.Label(parent, text="Temperature compensation",
                   style="Header.TLabel").pack(anchor="w")
-        ttk.Label(parent,
-                  text="Base setups are calibrated for 20°C ambient."
-                  ).pack(anchor="w", pady=(4, 0))
+
         row = ttk.Frame(parent); row.pack(fill="x", pady=(6, 0))
-        ttk.Label(row, text="Target ambient (°C):").pack(side="left")
-        self.temp_var = tk.StringVar(value=self.DEFAULT_TEMP)
-        ttk.Entry(row, textvariable=self.temp_var, width=6).pack(
-            side="left", padx=6)
-        ttk.Button(parent, text="Apply temperature comp",
-                   command=self._apply_temperature).pack(fill="x", pady=(6, 0))
+        # Live label showing the slider value (auto-updated on drag).
+        self.temp_value_var = tk.StringVar(value="20°C")
+        ttk.Label(row, textvariable=self.temp_value_var,
+                  font=("Helvetica", 12, "bold"),
+                  foreground="#cdb060",
+                  width=6).pack(side="right")
+
+        # The actual slider — pressures recompute on every change.
+        self.temp_var = tk.IntVar(value=20)
+        scale = tk.Scale(
+            row, from_=5, to=50, orient="horizontal",
+            variable=self.temp_var, showvalue=False, resolution=1,
+            length=180, sliderlength=18,
+            bg="#1c1f24", fg="#cdb060",
+            troughcolor="#2c3138", highlightthickness=0,
+            activebackground="#5cd0ff", borderwidth=0,
+            command=self._on_temperature_change,
+        )
+        scale.pack(side="left", fill="x", expand=True, padx=(0, 8))
 
         # ---- Loaded state ----
         ttk.Separator(parent).pack(fill="x", pady=10)
@@ -1432,24 +1451,21 @@ class SetupOptimizerApp:
         self.chart.set_data(None)
 
     # ---- temperature ----
-    def _apply_temperature(self) -> None:
-        if not self._require_setup():
-            return
+    def _on_temperature_change(self, value) -> None:
+        """Slider callback. Updates the live label and idempotently applies
+        the new temperature to the loaded setup. Fires on every drag step
+        — but `set_temperature` rewrites the queue line in place so we
+        don't accumulate junk."""
         try:
-            t = float(self.temp_var.get().strip())
-        except ValueError:
-            messagebox.showerror("Temperature",
-                                 "Enter a number, e.g. 28")
+            t = int(float(value))
+        except (ValueError, TypeError):
             return
-        before_n = len(self.mgr.changes)
-        self.mgr.changes.append("\n[PRE-RUN ADJUSTMENTS]")
-        self.mgr.adjust_for_temperature(t)
-        added = self.mgr.changes[before_n:]
-        if added:
-            for line in added:
-                if line.strip():
-                    self.queue.insert("end", line.splitlines()[0].strip())
-        self._set_status(f"Temperature compensation applied for {t}°C.")
+        self.temp_value_var.set(f"{t}°C")
+        if self.mgr is None:
+            return
+        self.mgr.set_temperature(t)
+        self._refresh_queue()
+        self._set_status(f"Temperature comp set to {t}°C.")
 
     # ---- track / corner ----
     def _on_track_change(self, _ev=None) -> None:
