@@ -222,32 +222,82 @@ class TelemetryAnalyzer:
                            "suspensiontravelrr", "shockposrr"],
     }
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str | list[str]) -> None:
         """Accept any of:
-        - a MoTeC i2 Pro CSV export (``.csv``)
-        - an ACC binary log (``.ld``)
-        - the sibling XML index (``.ldx``) — looks for the matching ``.ld``.
+        - a single path: ``.csv`` (i2 Pro export), ``.ld`` (ACC binary log),
+          or ``.ldx`` (XML index — we read the sibling .ld)
+        - a list of paths: each loaded separately, then concatenated. Time
+          and Distance are offset across files so they're continuous.
+
+        With multiple files, two extra columns are added:
+            ``__file_idx``    — 0-based index of the source file
+            ``__source_file`` — basename of the source file
+        These are used by ``detect_laps`` to keep file boundaries from
+        merging into one giant lap.
         """
-        self.csv_path = path
+        if isinstance(path, str):
+            paths = [path]
+        else:
+            paths = list(path)
+        if not paths:
+            raise ValueError("No telemetry files provided.")
+
+        self.source_paths = paths
+        self.csv_path = paths[0] if len(paths) == 1 \
+                        else f"{len(paths)} files"
+
+        per_file_dfs: list[pd.DataFrame] = []
+        time_acc = 0.0
+        dist_acc = 0.0
+        for i, p in enumerate(paths):
+            df_raw = self._load_one(p)
+            df = self._normalise_one(df_raw)
+            if df.empty:
+                continue
+
+            df["__file_idx"] = i
+            df["__source_file"] = os.path.basename(p)
+
+            # Offset Time and Distance so they're monotonic across files.
+            if "Time" in df.columns:
+                df["Time"] = df["Time"] - df["Time"].iloc[0] + time_acc
+                time_acc = float(df["Time"].iloc[-1]) + 0.1
+            if "Distance" in df.columns:
+                df["Distance"] = (
+                    df["Distance"] - df["Distance"].iloc[0] + dist_acc
+                )
+                dist_acc = float(df["Distance"].iloc[-1]) + 1.0
+
+            per_file_dfs.append(df)
+
+        if not per_file_dfs:
+            raise ValueError("None of the provided files yielded any rows.")
+
+        self.df = (per_file_dfs[0] if len(per_file_dfs) == 1
+                   else pd.concat(per_file_dfs, ignore_index=True))
+
+    @staticmethod
+    def _load_one(path: str) -> pd.DataFrame:
+        """Dispatch on file extension and return a raw DataFrame (no
+        normalisation, no unit fix-ups)."""
         ext = os.path.splitext(path)[1].lower()
         if ext == ".ld":
-            self.df = self._load_ld(path)
-        elif ext == ".ldx":
+            return TelemetryAnalyzer._load_ld_static(path)
+        if ext == ".ldx":
             ld_path = os.path.splitext(path)[0] + ".ld"
             if not os.path.isfile(ld_path):
                 raise FileNotFoundError(
-                    f".ldx file picked but its companion {os.path.basename(ld_path)} "
-                    f"is missing. Drop both files in the same folder."
+                    f".ldx file picked but its companion "
+                    f"{os.path.basename(ld_path)} is missing. Drop both "
+                    f"files in the same folder."
                 )
-            self.df = self._load_ld(ld_path)
-        else:
-            self.df = self._load_csv(path)
-        self._normalise_channels()
-        # Add a single "Susp_Travel" min-of-four as a convenience for
-        # bottoming detection if any of the per-corner channels exist.
-        susp_cols = [c for c in self.df.columns if c.startswith("Susp_Travel")]
-        if susp_cols and "Susp_Travel" not in self.df.columns:
-            self.df["Susp_Travel"] = self.df[susp_cols].min(axis=1)
+            return TelemetryAnalyzer._load_ld_static(ld_path)
+        return TelemetryAnalyzer._load_csv_static(path)
+
+    @staticmethod
+    def _load_ld_static(path: str) -> pd.DataFrame:
+        from motec_ld import ld_to_dataframe
+        return ld_to_dataframe(path)
 
     # ---- loading ----------------------------------------------------------
     @staticmethod
@@ -269,11 +319,13 @@ class TelemetryAnalyzer:
         return "".join(out)
 
     def _load_ld(self, path: str) -> pd.DataFrame:
-        """Read a MoTeC binary .ld log into a DataFrame using motec_ld."""
-        from motec_ld import ld_to_dataframe
-        return ld_to_dataframe(path)
+        return self._load_ld_static(path)
 
     def _load_csv(self, path: str) -> pd.DataFrame:
+        return self._load_csv_static(path)
+
+    @staticmethod
+    def _load_csv_static(path: str) -> pd.DataFrame:
         """Find the channel-name header row in a MoTeC i2 Pro CSV.
 
         i2 Pro CSVs emit a `"Key","Value"` metadata preamble (mostly 2-field
@@ -340,16 +392,18 @@ class TelemetryAnalyzer:
             df = df.iloc[1:].reset_index(drop=True)
         return df
 
-    def _normalise_channels(self) -> None:
+    def _normalise_one(self, df: pd.DataFrame) -> pd.DataFrame:
         """Rename CSV/LD columns to our canonical names, coerce to numeric,
         normalise units (m/s² → g, m/s → km/h), and synthesise a Distance
         channel from Speed × dt when ACC didn't log one directly.
 
-        Defends against duplicate-column corner cases that pandas hates.
+        DataFrame-in, DataFrame-out — does not touch ``self.df``, so it can
+        be reused by the multi-file constructor for each file before they
+        get concatenated.
         """
         rename: dict[str, str] = {}
-        existing_cols = set(self.df.columns)
-        norm_to_orig = {self._normalise(c): c for c in self.df.columns}
+        existing_cols = set(df.columns)
+        norm_to_orig = {self._normalise(c): c for c in df.columns}
 
         for canonical, aliases in self.CHANNEL_ALIASES.items():
             if canonical in existing_cols or canonical in rename.values():
@@ -360,77 +414,89 @@ class TelemetryAnalyzer:
                     break
 
         if rename:
-            self.df = self.df.rename(columns=rename)
+            df = df.rename(columns=rename)
+        if df.columns.duplicated().any():
+            df = df.loc[:, ~df.columns.duplicated(keep="first")]
 
-        # Drop duplicate columns to keep pandas happy.
-        if self.df.columns.duplicated().any():
-            self.df = self.df.loc[:, ~self.df.columns.duplicated(keep="first")]
-
-        for col in self.df.columns:
-            series = self.df[col]
+        for col in df.columns:
+            series = df[col]
             if isinstance(series, pd.DataFrame):
                 series = series.iloc[:, 0]
-            self.df[col] = pd.to_numeric(series, errors="coerce")
+            df[col] = pd.to_numeric(series, errors="coerce")
 
-        # ---- Unit normalisation ----
-        # ACC's MoTeC export writes G in m/s² (peak ~25 m/s² ≈ 2.5g) but
-        # the analyzer's heuristics expect g. Convert if the magnitudes
-        # look like m/s² (anything beyond ±5 is overwhelmingly m/s²).
+        # Unit normalisation: g and km/h.
         for g_col in ("G_Lat", "G_Lon"):
-            if g_col in self.df.columns:
-                peak = float(self.df[g_col].abs().max() or 0)
+            if g_col in df.columns:
+                peak = float(df[g_col].abs().max() or 0)
                 if peak > 5:
-                    self.df[g_col] = self.df[g_col] / 9.80665
-        # ACC writes Speed in m/s; convert to km/h (more readable in the
-        # chart, and consistent with what i2 Pro CSV exports use by default).
-        if "Speed" in self.df.columns:
-            peak_speed = float(self.df["Speed"].abs().max() or 0)
-            if peak_speed < 110:  # m/s — even Le Mans hypercars top out ~110 m/s
-                self.df["Speed"] = self.df["Speed"] * 3.6
+                    df[g_col] = df[g_col] / 9.80665
+        if "Speed" in df.columns:
+            peak_speed = float(df["Speed"].abs().max() or 0)
+            if peak_speed < 110:    # m/s
+                df["Speed"] = df["Speed"] * 3.6
 
-        # ---- Distance synthesis ----
-        # ACC's MoTeC export rarely logs a Distance channel — the chart and
-        # the auto-corner detector both need one, so we integrate Speed×dt.
-        if ("Distance" not in self.df.columns
-                and "Time" in self.df.columns
-                and "Speed" in self.df.columns):
-            dt = self.df["Time"].diff().fillna(0)
-            # Speed has been normalised to km/h above — convert back to m/s
-            # for integration so Distance is in metres.
-            speed_ms = self.df["Speed"] / 3.6
-            self.df["Distance"] = (speed_ms * dt).cumsum()
+        # Distance synthesis from Speed × dt.
+        if ("Distance" not in df.columns
+                and "Time" in df.columns
+                and "Speed" in df.columns):
+            dt = df["Time"].diff().fillna(0)
+            speed_ms = df["Speed"] / 3.6
+            df["Distance"] = (speed_ms * dt).cumsum()
 
-        if "Distance" in self.df.columns:
-            self.df = self.df.dropna(subset=["Distance"]).reset_index(drop=True)
+        if "Distance" in df.columns:
+            df = df.dropna(subset=["Distance"]).reset_index(drop=True)
         else:
-            self.df = self.df.dropna(how="all").reset_index(drop=True)
+            df = df.dropna(how="all").reset_index(drop=True)
+
+        # Susp_Travel min-of-four convenience column for bottoming detect.
+        susp_cols = [c for c in df.columns if c.startswith("Susp_Travel")]
+        if susp_cols and "Susp_Travel" not in df.columns:
+            df["Susp_Travel"] = df[susp_cols].min(axis=1)
+        return df
 
     # ---- lap detection ----------------------------------------------------
     def detect_laps(self) -> list[tuple[int, int]]:
         """Return ``[(start_idx, end_idx), …]`` per lap.
 
-        Uses the ``Lap`` channel if present; otherwise detects sharp drops
-        in ``Distance`` (track loops back to 0 at start/finish).
+        With multiple files combined, file boundaries become hard
+        lap-splits — each file gets its own lap range(s) so the user can
+        select laps from different files independently. Within each file
+        the Lap channel (or Distance reset) further splits laps.
         """
-        if "Lap" in self.df.columns and self.df["Lap"].notna().any():
+        # Split by source file first if multi-file is in play.
+        if ("__file_idx" in self.df.columns
+                and self.df["__file_idx"].nunique() > 1):
+            laps: list[tuple[int, int]] = []
+            for _file_idx, group in self.df.groupby("__file_idx"):
+                s = int(group.index.min())
+                e = int(group.index.max())
+                laps.extend(self._detect_laps_in_range(s, e))
+            return laps
+        return self._detect_laps_in_range(0, len(self.df) - 1)
+
+    def _detect_laps_in_range(self, s: int, e: int
+                              ) -> list[tuple[int, int]]:
+        """Detect laps within rows ``[s, e]``. Uses the Lap channel if
+        present, else looks for Distance resets within the slice."""
+        sub = self.df.iloc[s:e + 1]
+        if "Lap" in sub.columns and sub["Lap"].notna().any():
             laps = []
-            for lap_num, idxs in self.df.groupby("Lap").groups.items():
+            for lap_num, idxs in sub.groupby("Lap").groups.items():
                 if pd.notna(lap_num):
                     laps.append((int(min(idxs)), int(max(idxs))))
             return sorted(laps, key=lambda g: g[0])
 
-        if "Distance" not in self.df.columns:
-            return [(0, len(self.df) - 1)]
-
-        diffs = self.df["Distance"].diff().fillna(0)
+        if "Distance" not in sub.columns:
+            return [(s, e)]
+        diffs = sub["Distance"].diff().fillna(0)
         drops = list(diffs.index[diffs < -100].astype(int))
         if not drops:
-            return [(0, len(self.df) - 1)]
-        laps, prev = [], 0
+            return [(s, e)]
+        laps, prev = [], s
         for d in drops:
             laps.append((prev, int(d) - 1))
             prev = int(d)
-        laps.append((prev, len(self.df) - 1))
+        laps.append((prev, e))
         return laps
 
     # ---- auto corner detection -------------------------------------------
